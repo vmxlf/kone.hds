@@ -1,0 +1,574 @@
+#coding: utf8
+#title: kone 사이트 추가
+#comment: https://kone.gg
+
+import downloader
+from utils import urljoin, Downloader, Soup, clean_title, get_ext, File, Session
+from translator import tr_
+import errors
+import clf2
+from io import BytesIO
+import re # 정규 표현식 모듈 임포트
+import json
+from bs4 import Tag, NavigableString, BeautifulSoup
+import codecs
+import html # html 모듈 임포트 추가
+
+class LoginRequired(errors.LoginRequired):
+
+    def __init__(self, *args):
+        super().__init__(*args, method='browser', url='https://kone.gg/account/signin?path=%2F')
+
+
+def get_bbs_id(url):
+    if '/s/' in url:
+        bbs = url.split('/')[4]
+        id = url.split('/')[5]
+    return bbs, id
+
+
+class Downloader_kone(Downloader):
+    type = 'kone'
+    URLS = ['kone.gg']
+    icon = 'https://kone.gg/images/sub_icon.png'
+    ACCEPT_COOKIES = [r'(.*\.)?kone\.gg']
+    _soup = None
+
+    @property
+    def id(self):
+        board, channel = get_bbs_id(self.url)
+        return 'kone_{}_{}'.format(board, channel)
+
+    @property
+    def soup(self):
+        if self._soup is None:
+            html = clf2.solve(self.url, session=self.session)['html'] #7915
+            self._soup = Soup(html)
+            #div_btn = self._soup.find('div').findAll('button')
+            #if len(div_btn) > 1:
+                #raise LoginRequired()
+        return self._soup
+
+    @property
+    def name(self):
+        soup = self.soup
+        div = soup.find('h1', class_='flex')
+        if not div:
+            raise LoginRequired()
+        span = div.find_previous_sibling('span')
+        title = div.text + '_' + get_bbs_id(self.url)[1].split('?')[0]
+        # 유니코드 변환 보류
+        #title = title.replace('/', '／').replace('?', '？').replace(':', '꞉').replace(';', ';').replace('|', '￨').replace('"', '＂').replace('*', '＊').replace('<', '＜').replace('>', '＞').replace('\\', '＼').strip()
+        if span:
+            title = span.text + ' ' + title
+        else:
+            title = 'none' + ' ' + title
+        return clean_title(title)
+
+    def init(self):
+        self.session = Session()
+
+    def read(self):
+        self.title = tr_('읽는 중... {}').format(self.name)
+        set_imgs(self.url, self.soup)
+        self.urls += get_imgs(self.url, self.soup)
+        self.title = self.name
+        self.urls += [HTML({'referer': self.url, 'title': self.name, 'date': 10, 'p': 10}, self.soup)]
+
+class File_kone(File):
+    def alter(self):
+        return self['url'].replace('&type=orig', '')
+
+def set_imgs(url, soup):
+    view = soup.find('div', class_='prose-container')
+    style_tag = soup.new_tag('style')
+    style_tag.string = """
+/* Base typography styles */
+:host {
+color: inherit;
+font-family: inherit;
+line-height: inherit;
+}
+
+/* Content styling based on theme */
+.content {
+color: #27272a; /* zinc-800 */
+font-size: 1rem;
+line-height: 1.75;
+}
+
+.dark.content {
+color: #e4e4e7; /* zinc-200 */
+}
+
+/* Reset common elements */
+p, h1, h2, h3, h4, h5, h6 {
+margin: 0.5em 0;
+}
+
+/* Headings */
+h1 {
+font-size: 2rem;
+font-weight: 700;
+margin-top: 1.5em;
+margin-bottom: 0.5em;
+}
+
+h2 {
+font-size: 1.5rem;
+font-weight: 700;
+margin-top: 1.5em;
+margin-bottom: 0.5em;
+}
+
+h3 {
+font-size: 1.25rem;
+font-weight: 600;
+margin-top: 1.5em;
+margin-bottom: 0.5em;
+}
+
+/* Image containment */
+img {
+max-width: 100%;
+height: auto;
+margin: 1em 0;
+border-radius: 0.375em;
+}
+
+/* Table styling */
+table {
+border-collapse: collapse;
+width: 100%;
+margin: 1em 0;
+border-radius: 0.375em;
+overflow: hidden;
+}
+
+th {
+background-color: #f4f4f5; /* zinc-100 */
+font-weight: 600;
+text-align: left;
+}
+
+.dark th {
+background-color: #3f3f46; /* zinc-700 */
+}
+
+th, td {
+border: 1px solid #d4d4d8; /* zinc-300 */
+padding: 0.5em;
+}
+
+.dark th, .dark td {
+border: 1px solid #52525b; /* zinc-600 */
+padding: 0.5em;
+}
+
+/* Code blocks */
+pre {
+background-color: #18181b; /* zinc-900 */
+color: #e4e4e7; /* zinc-200 */
+padding: 1em;
+border-radius: 0.375em;
+overflow-x: auto;
+margin: 1em 0;
+font-size: 0.875rem;
+}
+
+code {
+font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+font-size: 0.875em;
+padding: 0.2em 0.4em;
+border-radius: 0.25em;
+background-color: #f4f4f5; /* zinc-100 */
+color: #18181b; /* zinc-900 */
+}
+
+.dark code {
+background-color: #3f3f46; /* zinc-700 */
+color: #e4e4e7; /* zinc-200 */
+}
+
+pre code {
+background-color: transparent;
+color: inherit;
+padding: 0;
+border-radius: 0;
+}
+
+/* Lists */
+ul, ol {
+padding-left: 1.5em;
+margin: 0.5em 0;
+}
+
+ul {
+list-style-type: disc;
+}
+
+ol {
+list-style-type: decimal;
+}
+
+li {
+margin-bottom: 0.25em;
+}
+
+li > ul, li > ol {
+margin-top: 0.25em;
+}
+
+/* Blockquotes */
+blockquote {
+border-left: 4px solid #d4d4d8; /* zinc-300 */
+margin: 1em 0;
+padding: 0.5em 0 0.5em 1em;
+color: #71717a; /* zinc-500 */
+font-style: italic;
+}
+
+.dark blockquote {
+border-left: 4px solid #52525b; /* zinc-600 */
+}
+
+/* Horizontal rule */
+hr {
+border: 0;
+border-top: 1px solid #d4d4d8; /* zinc-300 */
+margin: 2em 0;
+}
+
+.dark hr {
+border-top: 1px solid #52525b; /* zinc-600 */
+}
+
+/* Text alignment */
+.text-left {
+text-align: left;
+}
+
+.text-center {
+text-align: center;
+}
+
+.text-right {
+text-align: right;
+}
+
+/* Text formatting */
+strong, b {
+font-weight: 600;
+}
+
+em, i {
+font-style: italic;
+}
+
+u {
+text-decoration: underline;
+}
+
+s, strike, del {
+text-decoration: line-through;
+}
+
+sub, sup {
+font-size: 75%;
+line-height: 0;
+position: relative;
+vertical-align: baseline;
+}
+
+sup {
+top: -0.5em;
+}
+
+sub {
+bottom: -0.25em;
+}
+
+/* Highlight */
+mark {
+background-color: #fef9c3; /* yellow-100 */
+color: inherit;
+padding: 0.2em;
+border-radius: 0.25em;
+}
+
+.dark mark {
+background-color: #854d0e; /* yellow-800 */
+color: #fef9c3; /* yellow-100 */
+}
+
+/* Editor-specific styles */
+.ProseMirror-selectednode {
+outline: 2px solid #2563eb; /* blue-600 */
+}
+
+/* Prevent position:fixed from escaping */
+.content {
+position: relative;
+z-index: 1;
+overflow: visible;
+}
+
+/* Ensure position:fixed elements stay within shadow DOM */
+.content * {
+position: relative !important;
+z-index: auto !important;
+top: auto !important;
+left: auto !important;
+right: auto !important;
+bottom: auto !important;
+}
+
+/* Handle iframes */
+iframe {
+max-width: 100%;
+border: none;
+margin: 1em 0;
+}
+
+/* Custom styles passed in */
+
+/* Ensure proper typography for article content */
+.content {
+font-size: 1rem;
+line-height: 1.75;
+}
+
+/* Match your existing prose styles */
+.content p {
+margin: 0.5rem 0;
+}
+
+/* Light/dark mode */
+.content {
+color: #18181b;
+}
+
+@media (prefers-color-scheme: dark) {
+.content {
+color: #e4e4e7;
+}
+}
+
+/* Link styles */
+.content a {
+color: #2563eb;
+text-decoration: underline;
+}
+
+/* Fix potential sizing issues */
+.content * {
+max-width: 100%;
+}
+
+/* Prevent position:fixed from escaping */
+.content {
+position: relative;
+overflow: hidden;
+}
+    """
+    view.append(style_tag)
+    div = soup.new_tag('div')
+    #div['class'] = 'dark'
+    view.append(div)
+    view_div = view.find('div')
+    view_div.append(soup.new_tag("p"))
+    view_p = view_div.find('p')
+
+    compiled_regex = re.compile(r'self\.__next_f\.push\(\[1,\s*"(.*?)"\]\)', re.DOTALL)
+    matches_iterator = compiled_regex.finditer(str(soup))
+    raw_match_parts = []
+    for match in matches_iterator:
+        raw_match_parts.append(match.group(1))
+    combined_raw_string = "".join(raw_match_parts)
+
+    try:
+        compiled_regex = re.compile(r'\\\"Article\\\":(\{.*?\}),\\"Comments\\":', re.DOTALL)
+        match_object = compiled_regex.search(combined_raw_string)
+        match = match_object.group(1)
+
+        article_content_final = None
+        article_object_string_escaped = match
+        article_object_string_escaped = re.sub(r':\s*null\b', ':None', article_object_string_escaped)
+        article_object_string_escaped = json.loads(f'"{article_object_string_escaped}"')
+
+        try:
+            import ast
+            article_data_dict = ast.literal_eval(article_object_string_escaped)
+
+            if isinstance(article_data_dict, dict):
+                content_from_dict = article_data_dict.get("content")
+
+                if content_from_dict is not None:
+                    content_after_html_decode = html.unescape(content_from_dict)
+
+                    final_content = content_after_html_decode.replace('\\n', '\n')
+                    final_content = final_content.replace('\\r', '\r')
+                    final_content = final_content.replace('\\t', '\t')
+
+                    article_content_final = final_content
+        except Exception:
+            return
+
+        if article_content_final is None:
+            return
+
+        try:
+            decode_content = article_content_final
+            decode_content = html.unescape(decode_content)
+
+            new_soup = Soup(decode_content)
+            for element in new_soup.contents:
+                if isinstance(element, Tag):
+                    view_p.append(element)
+                elif element.string and element.string.strip():
+                    view_p.append(element.string)
+        except Exception:
+            view_p.append(match)
+
+        if view_p.string.startswith('$1f'):
+            view_p.clear()
+
+            processed_content = ""
+            try:
+                processed_content = json.loads(f'"{combined_raw_string}"')
+                processed_content = html.unescape(processed_content)
+            except Exception:
+                processed_content = combined_raw_string
+
+            compiled_regex = re.compile(r'1f:T([^,]*),')
+            match_object = compiled_regex.search(processed_content)
+            hex_length_str = match_object.group(1)
+            try:
+                data_length = int(hex_length_str, 16)
+            except ValueError:
+                return
+
+            extracted_segment = ""
+            extraction_start_index = match_object.end()
+            if extraction_start_index + data_length <= len(processed_content):
+                    extracted_segment = processed_content[extraction_start_index : extraction_start_index + data_length]
+            elif len(processed_content) - extraction_start_index > 0:
+                    extracted_segment = processed_content[extraction_start_index:]
+
+            if extracted_segment:
+                try:
+                    regex_pattern = r'd:\["\$"'
+                    raw_match = re.search(regex_pattern, extracted_segment)
+                    if raw_match:
+                        extracted_segment = extracted_segment[:raw_match.start()]
+
+                    new_soup = BeautifulSoup(extracted_segment, 'html.parser')
+                    code_blocks_to_sanitize = []
+                    for code_tag in new_soup.find_all('code'):
+                        if code_tag.parent and code_tag.parent.name == 'pre':
+                            code_blocks_to_sanitize.append(code_tag)
+
+                    for code_tag in code_blocks_to_sanitize:
+                        inner_html_of_code_tag = code_tag.decode_contents()
+                        code_tag.clear()
+                        code_tag.append(NavigableString(inner_html_of_code_tag))
+
+                    for element in new_soup.find_all(True, recursive=False):
+                        if isinstance(element, Tag):
+                            view_p.append(element)
+                        elif element.string and element.string.strip():
+                            view_p.append(NavigableString(element.string))
+                except Exception as e:
+                    view_p.append(extracted_segment)
+
+    except Exception as e:
+        return
+
+
+def get_imgs(url, soup):
+    mute = soup.find('div', class_='text-muted')
+    if mute:
+        raise LoginRequired(mute.text.strip())
+
+    imgs = []
+    url_imgs = set()
+
+    view = soup.find('div', {'class': 'prose-container'})
+    for div_rel in view.findAll('div'):
+        for div_prose in div_rel.findAll('p'):
+            for img in div_prose.findAll(['img', 'video']):
+                url_img = img.get('src') or img.get('data-originalurl')
+                if not url_img:
+                    continue
+                url_img = urljoin(url, url_img)
+                if url_img in url_imgs:
+                    continue
+                url_imgs.add(url_img)
+                ext = get_ext(url_img)
+                ext = ext if ext else '.webp' # 확장자 없을 경우 기본값 설정
+                name = f'{len(imgs):04}{ext}'
+                img = File_kone({'referer':url, 'url':url_img, 'name':name})
+                imgs.append(img)
+
+    return imgs
+
+class HTML(File):
+    type = 'kone'
+    format = 'title'
+
+    def __init__(self, info, soup):
+        info['title_all'] = info['title']
+        d = {
+            'title': info['title_all'],
+            }
+        info['name'] = utils.format(self.type, d, '.html')
+        super().__init__(info)
+        self.soup = soup
+        self.referer_url = info['referer']
+
+    def get(self):
+        # css
+        link_href = self.soup.find('link', {'rel': 'stylesheet'})
+        link_url = "https://kone.gg" + link_href.get('href')
+        html = clf2.solve(link_url, session=self.session)['html']
+        new_style = self.soup.new_tag('style')
+        new_style.string = html
+        self.soup.find('div', class_='md:container').append(new_style)
+
+        text_tag = self.soup.find('div', class_='md:container')
+        text_str = str(text_tag) # 태그를 문자열로 변환
+        cleaned_text_str = text_str
+
+        # 3. 이미지 태그에서 href를 대응
+        imgs = []
+        url_imgs = set()
+
+        style_str = """<html lang="ko" class="light"><head><body class="" style="">"""
+        style_end_str = """</body></head></html>"""
+
+        view = self.soup.find('div', {'class': 'prose-container'})
+        for div_rel in view.findAll('div'):
+            for div_prose in div_rel.findAll('p'):
+                for img in div_prose.findAll(['img', 'video']):
+                    url_img = img.get('src') or img.get('data-originalurl')
+                    if url_img in url_imgs:
+                        continue
+                    url_imgs.add(url_img)
+                    ext = get_ext(url_img)
+                    ext = ext if ext else '.webp' # 확장자 없을 경우 기본값 설정
+                    name = f'{len(imgs):04}{ext}'
+
+                    cleaned_text_str = cleaned_text_str.replace('amp;', '') # amp; 제거
+                    #cleaned_text_str = cleaned_text_str.replace('spoiler-filter', '') # spoiler-filter 제거
+                    cleaned_text_str = cleaned_text_str.replace(str(url_img), name) # 이미지 URL을 대체
+
+                    imgs.append(url_img)
+
+        cleaned_text_str = style_str + cleaned_text_str + style_end_str
+
+        f = BytesIO()
+        f.write(cleaned_text_str.encode('utf8')) # 수정된 문자열을 인코딩하여 저장
+        f.seek(0)
+        return {'url': f}
+
+messageBox('{}: kone'.format(tr_('사이트를 추가했습니다')))
