@@ -430,7 +430,8 @@ overflow: hidden;
         except Exception:
             view_p.append(match)
 
-        if view_p.string.startswith('$1f'):
+        if view_p.string.startswith('$'):
+            code_str = view_p.string[1:]
             view_p.clear()
 
             processed_content = ""
@@ -440,7 +441,7 @@ overflow: hidden;
             except Exception:
                 processed_content = combined_raw_string
 
-            compiled_regex = re.compile(r'1f:T([^,]*),')
+            compiled_regex = re.compile(rf'{code_str}:T([^,]*),')
             match_object = compiled_regex.search(processed_content)
             hex_length_str = match_object.group(1)
             try:
