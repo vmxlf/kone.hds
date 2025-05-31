@@ -458,7 +458,7 @@ overflow: hidden;
 
             if extracted_segment:
                 try:
-                    regex_pattern = r'[de]:\["\$"'
+                    regex_pattern = r'[a-z]:\["\$"'
                     raw_match = re.search(regex_pattern, extracted_segment)
                     if raw_match:
                         extracted_segment = extracted_segment[:raw_match.start()]
