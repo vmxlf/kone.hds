@@ -71,7 +71,7 @@ class Downloader_kone(Downloader):
     def read(self):
         self.title = tr_('읽는 중... {}').format(self.name)
         set_imgs(self.url, self.soup)
-        self.urls += get_imgs(self.url, self.soup)
+        self.urls += get_imgs(self.url, self.soup, self.session)
         self.title = self.name
         self.urls += [HTML({'referer': self.url, 'title': self.name, 'date': 10, 'p': 10}, self.soup)]
 
@@ -486,7 +486,7 @@ overflow: hidden;
         return
 
 
-def get_imgs(url, soup):
+def get_imgs(url, soup, session):
     mute = soup.find('div', class_='text-muted')
     if mute:
         raise LoginRequired(mute.text.strip())
@@ -505,6 +505,21 @@ def get_imgs(url, soup):
                 if url_img in url_imgs:
                     continue
                 url_imgs.add(url_img)
+
+                 # 원본 이미지 URL을 가져오기
+                original_url = "https://api.kone.gg/v0/article/"+get_bbs_id(url)[1]+"/media/original"
+                original_data = {'media_url': [url_img]}
+                original_headers = {'Content-Type': 'application/json'}
+                original_response = session.post(original_url, json=original_data, headers=original_headers, timeout=10)
+                original_response.raise_for_status()
+                original_json = original_response.json()
+                try:
+                    original_media = original_json['media'][0]
+                    if original_media.get('original') is True:
+                        url_img = original_media.get('url', url_img) 
+                except (TypeError, KeyError, IndexError):
+                    pass
+
                 ext = get_ext(url_img)
                 ext = ext if ext else '.webp' # 확장자 없을 경우 기본값 설정
                 name = f'{len(imgs):04}{ext}'
