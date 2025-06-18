@@ -506,8 +506,9 @@ def get_imgs(url, soup, session):
                     continue
                 url_imgs.add(url_img)
 
-                 # 원본 이미지 URL을 가져오기
-                original_url = "https://api.kone.gg/v0/article/"+get_bbs_id(url)[1]+"/media/original"
+                # 원본 이미지 URL을 가져오기
+                bbs_id = re.sub(r'\?.*$', '', get_bbs_id(url)[1])
+                original_url = "https://api.kone.gg/v0/article/"+bbs_id+"/media/original"
                 original_data = {'media_url': [url_img]}
                 original_headers = {'Content-Type': 'application/json'}
                 original_response = session.post(original_url, json=original_data, headers=original_headers, timeout=10)
