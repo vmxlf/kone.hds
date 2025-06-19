@@ -506,6 +506,12 @@ def get_imgs(url, soup, session):
                     continue
                 url_imgs.add(url_img)
 
+                # 본문 이미지 URL을 처리
+                ext = get_ext(url_img)
+                ext = ext if ext else '.webp' # 확장자 없을 경우 기본값 설정
+                name = f'{len(imgs):04}{ext}'
+                img = File_kone({'referer':url, 'url':url_img, 'name':name})
+
                 # 원본 이미지 URL을 가져오기
                 bbs_id = re.sub(r'\?.*$', '', get_bbs_id(url)[1])
                 original_url = "https://api.kone.gg/v0/article/"+bbs_id+"/media/original"
@@ -518,13 +524,14 @@ def get_imgs(url, soup, session):
                     original_media = original_json['media'][0]
                     if original_media.get('original') is True:
                         url_img = original_media.get('url', url_img) 
+                        ext = get_ext(url_img)
+                        ext = ext if ext else '.webp' # 확장자 없을 경우 기본값 설정
+                        name = f'{len(imgs):04}{ext}'
+                        original_img = File_kone({'referer':url, 'url':url_img, 'name':name})
+                        imgs.append(original_img)
                 except (TypeError, KeyError, IndexError):
                     pass
-
-                ext = get_ext(url_img)
-                ext = ext if ext else '.webp' # 확장자 없을 경우 기본값 설정
-                name = f'{len(imgs):04}{ext}'
-                img = File_kone({'referer':url, 'url':url_img, 'name':name})
+                
                 imgs.append(img)
 
     return imgs
