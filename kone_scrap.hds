@@ -513,14 +513,14 @@ def get_imgs(url, soup, session):
                 img = File_kone({'referer':url, 'url':url_img, 'name':name})
 
                 # 원본 이미지 URL을 가져오기
-                bbs_id = re.sub(r'\?.*$', '', get_bbs_id(url)[1])
-                original_url = "https://api.kone.gg/v0/article/"+bbs_id+"/media/original"
-                original_data = {'media_url': [url_img]}
-                original_headers = {'Content-Type': 'application/json'}
-                original_response = session.post(original_url, json=original_data, headers=original_headers, timeout=10)
-                original_response.raise_for_status()
-                original_json = original_response.json()
                 try:
+                    bbs_id = re.sub(r'\?.*$', '', get_bbs_id(url)[1])
+                    original_url = "https://api.kone.gg/v0/article/"+bbs_id+"/media/original"
+                    original_data = {'media_url': [url_img]}
+                    original_headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36', 'Content-Type': 'application/json', 'Referer': 'https://kone.gg/' }
+                    original_response = session.post(original_url, json=original_data, headers=original_headers, timeout=10)
+                    original_response.raise_for_status()
+                    original_json = original_response.json()
                     original_media = original_json['media'][0]
                     if original_media.get('original') is True:
                         url_img = original_media.get('url', url_img) 
@@ -529,7 +529,7 @@ def get_imgs(url, soup, session):
                         name = f'{len(imgs):04}{ext}'
                         original_img = File_kone({'referer':url, 'url':url_img, 'name':name})
                         imgs.append(original_img)
-                except (TypeError, KeyError, IndexError):
+                except Exception:
                     pass
                 
                 imgs.append(img)
