@@ -496,7 +496,9 @@ def get_imgs(self):
         raise LoginRequired(mute.text.strip())
 
     imgs = []
-    url_imgs = set()
+    url_imgs = []
+    url_imgs_set = set()
+    original_url_imgs = []
 
     view = soup.find('div', {'class': 'prose-container'})
     for div_rel in view.findAll('div'):
@@ -506,30 +508,32 @@ def get_imgs(self):
                 if not url_img:
                     continue
                 url_img = urljoin(url, url_img)
-                if url_img in url_imgs:
+                if url_img in url_imgs_set:
                     continue
-                url_imgs.add(url_img)
-                final_url_img = url_img
+                url_imgs.append(url_img)
+                url_imgs_set.add(url_img)
+    
+    # 원본 이미지 URL을 가져오기
+    try:
+        bbs_id = re.sub(r'\?.*$', '', get_bbs_id(url)[1])
+        api_url = "https://api.kone.gg/v0/article/"+bbs_id+"/media/original"
+        api_data = {'media_url': url_imgs}
+        api_headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36', 'Content-Type': 'application/json', 'Referer': 'https://kone.gg/' }
+        response = session.post(api_url, json=api_data, timeout=10)
+        response.raise_for_status()
+        media_data = response.json()
+        original_url_imgs = [media.get('url') for media in media_data.get('media', []) if media.get('url')]
+    except Exception:
+        pass
 
-                # 원본 이미지 URL을 가져오기
-                try:
-                    bbs_id = re.sub(r'\?.*$', '', get_bbs_id(url)[1])
-                    original_url = "https://api.kone.gg/v0/article/"+bbs_id+"/media/original"
-                    original_data = {'media_url': [url_img]}
-                    original_headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36', 'Content-Type': 'application/json', 'Referer': 'https://kone.gg/' }
-                    original_response = session.post(original_url, json=original_data, timeout=10)
-                    original_response.raise_for_status()
-                    original_media = original_response.json()['media'][0]
-                    if original_media.get('original') is True:
-                        final_url_img = original_media.get('url', url_img) 
-                except Exception:
-                    pass
+    if len(url_imgs) != len(original_url_imgs):
+        original_url_imgs = url_imgs
+    for i, (url_img, originla_url_img) in enumerate(zip(url_imgs, original_url_imgs)):
+        ext = get_ext(originla_url_img) or ".webp"
+        name = f'{i:04}{ext}'
+        img = File_kone({'referer':url_img, 'url':originla_url_img, 'name':name})
+        imgs.append(img)
 
-                ext = get_ext(final_url_img) or '.webp'
-                name = f'{len(imgs):04}{ext}'
-                img = File_kone({'referer':url_img, 'url':final_url_img, 'name':name})
-                imgs.append(img)
-                
     return imgs
 
 class HTML(File):
