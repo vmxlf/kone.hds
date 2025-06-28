@@ -3,7 +3,7 @@
 #comment: https://kone.gg
 
 import downloader
-from utils import urljoin, Downloader, Soup, clean_title, get_ext, File, Session
+from utils import urljoin, Downloader, Soup, clean_title, get_ext, File, Session, get_print
 from translator import tr_
 import errors
 import clf2
@@ -71,7 +71,7 @@ class Downloader_kone(Downloader):
 
     def read(self):
         self.title = tr_('읽는 중... {}').format(self.name)
-        set_imgs(self.url, self.soup)
+        set_imgs(self)
         self.urls += get_imgs(self)
         self.title = self.name
         self.urls += [HTML({'referer': self.url, 'title': self.name, 'date': 10, 'p': 10}, self.soup)]
@@ -80,7 +80,9 @@ class File_kone(File):
     def alter(self):
         return self['referer']
 
-def set_imgs(url, soup):
+def set_imgs(self):
+    url = self.url
+    soup = self.soup
     view = soup.find('div', class_='prose-container')
     style_tag = soup.new_tag('style')
     style_tag.string = """
@@ -388,16 +390,16 @@ overflow: hidden;
     combined_raw_string = "".join(raw_match_parts)
 
     try:
-        compiled_regex = re.compile(r'\\\"Article\\\":(\{.*?\}),\\"Comments\\":', re.DOTALL)
+        compiled_regex = re.compile(r'\\"Article\\":(\{.*?\}),\\"Comments\\":', re.DOTALL)
         match_object = compiled_regex.search(combined_raw_string)
         match = match_object.group(1)
 
         article_content_final = None
-        article_object_string_escaped = match
-        article_object_string_escaped = re.sub(r':\s*null\b', ':None', article_object_string_escaped)
-        article_object_string_escaped = json.loads(f'"{article_object_string_escaped}"')
-
         try:
+            article_object_string_escaped = match
+            article_object_string_escaped = re.sub(r':\s*null\b', ':None', article_object_string_escaped)
+            article_object_string_escaped = json.loads(f'"{article_object_string_escaped}"')
+            
             import ast
             article_data_dict = ast.literal_eval(article_object_string_escaped)
 
@@ -423,14 +425,14 @@ overflow: hidden;
             decode_content = html.unescape(decode_content)
 
             new_soup = Soup(decode_content)
-            for element in new_soup.contents:
+            for element in new_soup.contents[:]:
                 if isinstance(element, Tag):
                     view_p.append(element)
                 elif element.string and element.string.strip():
                     view_p.append(element.string)
         except Exception:
-            view_p.append(match)
-
+            view_p.append(article_content_final)
+        
         if view_p.string.startswith('$'):
             code_str = view_p.string[1:]
             view_p.clear()
@@ -483,7 +485,7 @@ overflow: hidden;
                 except Exception as e:
                     view_p.append(extracted_segment)
 
-    except Exception as e:
+    except Exception:
         return
 
 
