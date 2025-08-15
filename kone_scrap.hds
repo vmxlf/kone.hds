@@ -559,9 +559,9 @@ class HTML(File):
         html = clf2.solve(link_url, session=self.session)['html']
         new_style = self.soup.new_tag('style')
         new_style.string = html
-        self.soup.find('div', class_='md:container').append(new_style)
+        self.soup.find('main', class_='flex').find('div', class_='mx-auto').append(new_style)
 
-        text_tag = self.soup.find('div', class_='md:container')
+        text_tag = self.soup.find('main', class_='flex').find('div', class_='mx-auto')
         text_str = str(text_tag) # 태그를 문자열로 변환
         cleaned_text_str = text_str
 
