@@ -560,14 +560,9 @@ class HTML(File):
         new_style = self.soup.new_tag('style')
         new_style.string = html
         self.soup.find('main', class_='flex').find('div', class_='mx-auto').append(new_style)
-
-        text_tag = self.soup.find('main', class_='flex').find('div', class_='mx-auto')
-        text_str = str(text_tag) # 태그를 문자열로 변환
-        cleaned_text_str = text_str
-
-        # 3. 이미지 태그에서 href를 대응
+        
         imgs = []
-        url_imgs = set()
+        processed_tags = set()
 
         style_str = """<html lang="ko" class="light"><head><body class="" style="">"""
         style_end_str = """</body></head></html>"""
@@ -576,20 +571,20 @@ class HTML(File):
         for div_rel in view.findAll('div'):
             for div_prose in div_rel.findAll('p'):
                 for img in div_prose.findAll(['img', 'video']):
-                    url_img = img.get('src') or img.get('data-originalurl')
-                    if url_img in url_imgs:
+                    if img in processed_tags:
                         continue
-                    url_imgs.add(url_img)
+                    url_img = img.get('src') or img.get('data-originalurl')
+                    original_attr = 'src' if img.get('src') else 'data-originalurl' # 원본 속성 저장
                     ext = get_ext(url_img)
                     ext = ext if ext else '.webp' # 확장자 없을 경우 기본값 설정
                     name = f'{len(imgs):04}{ext}'
-
-                    cleaned_text_str = cleaned_text_str.replace('amp;', '') # amp; 제거
-                    #cleaned_text_str = cleaned_text_str.replace('spoiler-filter', '') # spoiler-filter 제거
-                    cleaned_text_str = cleaned_text_str.replace(str(url_img), name) # 이미지 URL을 대체
-
+                    img[original_attr] = name
                     imgs.append(url_img)
-
+                    processed_tags.add(img)
+        
+        text_tag = self.soup.find('main', class_='flex').find('div', class_='mx-auto')
+        cleaned_text_str = str(text_tag)
+        cleaned_text_str = cleaned_text_str.replace('amp;', '')
         cleaned_text_str = style_str + cleaned_text_str + style_end_str
 
         f = BytesIO()
