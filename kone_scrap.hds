@@ -237,7 +237,7 @@ class Downloader_kone(Downloader):
                     status = None
                     def check_cb(r): nonlocal status; status = r
                     browser.runJavaScript(js_check, callback=check_cb)
-                    time.sleep(0.5)
+                    time.sleep(0.1)
                     
                     if status:
                         curr_count = status.get('count', 0)
@@ -446,10 +446,13 @@ class HTML(File):
     format = 'title'
 
     def __init__(self, info, soup, imgs_files):
-        d = {'title': info.get('title', 'No Title')}
+        original_title = info.get('title', 'No Title')
+        safe_title = clean_title(original_title)
+        d = {'title': safe_title}
         info['name'] = utils.format(self.type, d, '.html')
         super().__init__(info)
         
+        self.original_title_text = original_title
         self.soup = soup
         self.referer_url = info.get('referer', '')
         self.imgs_files = imgs_files 
@@ -468,7 +471,7 @@ class HTML(File):
             try: return self[k]
             except: return d
 
-        title = safe_get('title', 'No Title')
+        title = self.original_title_text
         writer_data = safe_get('writer', {})
         if not isinstance(writer_data, dict): writer_data = {}
         
