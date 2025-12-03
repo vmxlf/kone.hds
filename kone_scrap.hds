@@ -237,7 +237,7 @@ class Downloader_kone(Downloader):
                     status = None
                     def check_cb(r): nonlocal status; status = r
                     browser.runJavaScript(js_check, callback=check_cb)
-                    time.sleep(0.1)
+                    time.sleep(0.5)
                     
                     if status:
                         curr_count = status.get('count', 0)
