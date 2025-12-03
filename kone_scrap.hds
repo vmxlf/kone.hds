@@ -8,17 +8,90 @@ from translator import tr_
 import errors
 import clf2
 from io import BytesIO
-import re # 정규 표현식 모듈 임포트
+import re
 import json
-from bs4 import Tag, NavigableString, BeautifulSoup
-import codecs
-import html # html 모듈 임포트 추가
+import html as html_module
+import time
+import datetime
+from bs4 import Tag, NavigableString, BeautifulSoup 
+
+# [CSS Styles]
+KONE_CSS = """
+/* Reset & Base */
+body { margin: 0; padding: 0; background-color: #fff; color: #27272a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; line-height: 1.5; }
+* { box-sizing: border-box; }
+a { text-decoration: none; color: inherit; }
+
+/* Layout Utilities */
+.container { width: 100%; max-width: 1200px; margin: 0 auto; padding: 20px; }
+.flex { display: flex; }
+.flex-col { flex-direction: column; }
+.items-center { align-items: center; }
+.items-end { align-items: flex-end; }
+.items-start { align-items: flex-start; }
+.justify-between { justify-content: space-between; }
+.gap-1 { gap: 0.25rem; }
+.gap-2 { gap: 0.5rem; }
+.gap-3 { gap: 0.75rem; }
+.mb-3 { margin-bottom: 0.75rem; }
+.pb-4 { padding-bottom: 1rem; }
+.pt-2 { padding-top: 0.5rem; }
+.pl-6 { padding-left: 1.5rem; }
+.pr-3 { padding-right: 0.75rem; }
+.p-4 { padding: 1rem; }
+
+/* Typography */
+.text-2xl { font-size: 1.5rem; line-height: 2rem; }
+.font-bold { font-weight: 700; }
+.font-medium { font-weight: 500; }
+.text-sm { font-size: 0.875rem; line-height: 1.25rem; }
+.text-xs { font-size: 0.75rem; line-height: 1rem; }
+.text-zinc-400 { color: #a1a1aa; }
+.text-zinc-500 { color: #71717a; }
+.text-zinc-50 { color: #fafafa; }
+.bg-zinc-700 { background-color: #3f3f46; }
+.bg-zinc-100 { background-color: #f4f4f5; }
+.rounded-full { border-radius: 9999px; }
+.rounded-lg { border-radius: 0.5rem; }
+
+/* Badge & Header */
+.badge { display: inline-flex; align-items: center; justify-content: center; background-color: #3f3f46; color: white; border-radius: 9999px; padding: 2px 8px; font-size: 0.75rem; font-weight: 600; margin-right: 8px; vertical-align: middle; }
+h1 { margin: 0; display: inline; vertical-align: middle; }
+
+/* Content Body */
+.prose-container { margin-top: 20px; font-size: 1rem; line-height: 1.75; color: #27272a; }
+.prose-container img, .prose-container video { 
+    max-width: 100% !important; 
+    height: auto !important; 
+    display: block !important; 
+    margin: 10px auto !important; 
+    border-radius: 8px; 
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); 
+}
+.prose-container p { margin-bottom: 1em; }
+
+/* Comments */
+.comment-section { margin-top: 3rem; border-top: 1px solid #e4e4e7; padding-top: 1rem; }
+.comment-item { margin-bottom: 1rem; padding: 0.5rem; border-radius: 0.5rem; }
+.comment-avatar-box { width: 1.5rem; height: 1.5rem; border-radius: 9999px; background-color: #e4e4e7; flex-shrink: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 0.75rem;}
+.comment-avatar-box img { width: 100%; height: 100%; object-fit: cover; }
+.comment-content { font-size: 0.9rem; white-space: pre-wrap; word-break: break-word; margin-top: 0.25rem; color: #333; }
+.comment-image { max-width: 200px; max-height: 200px; display: block; margin: 5px 0; border-radius: 4px; }
+.reply-indent { margin-left: 2rem; border-left: 2px solid #f4f4f5; padding-left: 0.5rem; }
+
+/* Dark Mode */
+@media (prefers-color-scheme: dark) {
+    body { background-color: #18181b; color: #e4e4e7; }
+    .prose-container { color: #e4e4e7; }
+    .comment-content { color: #e4e4e7; }
+    .comment-section { border-top-color: #3f3f46; }
+    .comment-item:hover { background-color: #27272a; }
+}
+"""
 
 class LoginRequired(errors.LoginRequired):
-
     def __init__(self, *args):
         super().__init__(*args, method='browser', url='https://kone.gg/account/signin?path=%2F')
-
 
 def get_bbs_id(url):
     if '/s/' in url:
@@ -26,6 +99,89 @@ def get_bbs_id(url):
         id = url.split('/')[5]
     return bbs, id
 
+def parse_nextjs_data(next_f_data):
+    if not next_f_data: return None
+    
+    # Merge split chunks
+    full_raw_string = ""
+    for item in next_f_data:
+        if len(item) >= 2 and isinstance(item[1], str):
+            full_raw_string += item[1]
+
+    chunk_map = {}       
+    parsed_result = {'article': None, 'comments': []}
+
+    # Extract HTML chunks
+    matches = re.finditer(r'(\d+):T([0-9a-fA-F]+),', full_raw_string)
+    for match in matches:
+        try:
+            chunk_id = match.group(1)
+            data_len = int(match.group(2), 16)
+            start_idx = match.end()
+            if start_idx + data_len <= len(full_raw_string):
+                chunk_content = full_raw_string[start_idx : start_idx + data_len]
+                chunk_map[chunk_id] = chunk_content
+            else:
+                chunk_content = full_raw_string[start_idx:]
+                chunk_map[chunk_id] = chunk_content
+        except: pass
+
+    # Extract JSON Data (Article & Comments)
+    if '"Article":' in full_raw_string:
+        lines = full_raw_string.split('\n')
+        for line in lines:
+            json_match = re.search(r'(\d+):([\[\{].*)', line)
+            if json_match:
+                json_candidate = json_match.group(2)
+                parsed = None
+                try:
+                    parsed = json.loads(json_candidate)
+                except json.JSONDecodeError:
+                    # Smart parsing: trimming trailing garbage characters
+                    try:
+                        last_brace = max(json_candidate.rfind('}'), json_candidate.rfind(']'))
+                        if last_brace != -1:
+                            parsed = json.loads(json_candidate[:last_brace+1])
+                    except: pass
+                
+                if parsed:
+                    def find_key(obj, key):
+                        if isinstance(obj, dict):
+                            if key in obj: return obj[key]
+                            for v in obj.values():
+                                res = find_key(v, key)
+                                if res: return res
+                        elif isinstance(obj, list):
+                            for v in obj:
+                                res = find_key(v, key)
+                                if res: return res
+                        return None
+
+                    if not parsed_result['article']:
+                        art = find_key(parsed, 'Article')
+                        if art: parsed_result['article'] = art
+                    
+                    if not parsed_result['comments']:
+                        coms = find_key(parsed, 'Comments')
+                        if coms and isinstance(coms, list):
+                            parsed_result['comments'] = coms
+
+    # Merge chunks into content
+    if parsed_result['article']:
+        content_ref = parsed_result['article'].get('content')
+        if isinstance(content_ref, str) and content_ref.startswith('$'):
+            ref_id = content_ref[1:]
+            if ref_id in chunk_map:
+                parsed_result['article']['content'] = chunk_map[ref_id]
+        return parsed_result
+
+    # Fallback return
+    if chunk_map:
+        longest_chunk = max(chunk_map.values(), key=len)
+        fake_article = {'title': 'Unknown', 'content': longest_chunk, 'writer': {'display_name': 'Unknown'}}
+        return {'article': fake_article, 'comments': []}
+        
+    return None
 
 class Downloader_kone(Downloader):
     type = 'kone'
@@ -33,6 +189,8 @@ class Downloader_kone(Downloader):
     icon = 'https://kone.gg/images/sub_icon.png'
     ACCEPT_COOKIES = [r'(.*\.)?kone\.gg']
     _soup = None
+    _article_data = None 
+    _comments_data = [] 
 
     @property
     def id(self):
@@ -42,28 +200,171 @@ class Downloader_kone(Downloader):
     @property
     def soup(self):
         if self._soup is None:
-            html = clf2.solve(self.url, session=self.session)['html'] #7915
-            self._soup = Soup(html)
-            #div_btn = self._soup.find('div').findAll('button')
-            #if len(div_btn) > 1:
-                #raise LoginRequired()
+            token = None
+            
+            # Check data stability
+            js_check = """
+            (() => {
+                const n = self.__next_f || window.__NEXT_DATA__;
+                if (!n) return { count: 0, has_article: false };
+                let found = false;
+                for (let i = 0; i < n.length; i++) {
+                    if (n[i] && typeof n[i][1] === 'string' && n[i][1].includes('"Article":')) {
+                        found = true; break;
+                    }
+                }
+                return { count: n.length, has_article: found };
+            })()
+            """
+            
+            # Fetch data
+            js_fetch = """
+            (() => {
+                return {
+                    html: document.documentElement.outerHTML,
+                    data: self.__next_f || window.__NEXT_DATA__ || []
+                };
+            })()
+            """
+
+            def f(html, browser=None):
+                nonlocal token
+                last_count = -1
+                stable_cycles = 0
+                REQUIRED_STABILITY = 6 
+
+                for _ in range(120):
+                    status = None
+                    def check_cb(r): nonlocal status; status = r
+                    browser.runJavaScript(js_check, callback=check_cb)
+                    time.sleep(0.5)
+                    
+                    if status:
+                        curr_count = status.get('count', 0)
+                        has_article = status.get('has_article', False)
+                        
+                        if has_article:
+                            if curr_count == last_count:
+                                stable_cycles += 1
+                            else:
+                                stable_cycles = 0
+                                last_count = curr_count
+                            
+                            if stable_cycles >= REQUIRED_STABILITY:
+                                break
+                
+                def fetch_cb(r): nonlocal token; token = r
+                browser.runJavaScript(js_fetch, callback=fetch_cb)
+                
+                for _ in range(10):
+                    if token: break
+                    time.sleep(0.5)
+
+                browser.hide()
+                return True
+
+            res = clf2.solve(self.url, f=f, session=self.session)
+            
+            if not token or not isinstance(token, dict):
+                self._soup = Soup(res['html'])
+                self._save_info_from_soup(self._soup)
+                return self._soup
+
+            next_f_data = token.get('data')
+            hydrated_html = token.get('html')
+
+            parsed = parse_nextjs_data(next_f_data)
+            
+            if parsed and parsed.get('article'):
+                self._article_data = parsed['article']
+                self._comments_data = parsed.get('comments', [])
+                content_html = self._article_data.get('content', '')
+                self._soup = Soup(content_html)
+
+                if hydrated_html:
+                    self._save_info_from_soup(Soup(hydrated_html))
+                
+                if not self._comments_data and hydrated_html:
+                    self._comments_data = self._extract_comments_from_html(Soup(hydrated_html))
+
+            elif hydrated_html:
+                full_soup = Soup(hydrated_html)
+                self._save_info_from_soup(full_soup)
+                self._comments_data = self._extract_comments_from_html(full_soup)
+                content_div = full_soup.find('div', class_='prose-container') or full_soup.find('main')
+                self._soup = content_div if content_div else full_soup
+            else:
+                self._soup = Soup(res['html'])
+                self._save_info_from_soup(self._soup)
+                
         return self._soup
+
+    def _save_info_from_soup(self, soup):
+        if not self._article_data: self._article_data = {}
+
+        h1 = soup.find('h1', class_='flex')
+        if h1:
+            title_text = h1.get_text(strip=True)
+            badge = h1.find_previous_sibling('span', attrs={'data-slot': 'badge'})
+
+            if badge:
+                cat_name = badge.get_text(strip=True)
+                self._article_data['title'] = f"[{cat_name}] {title_text}"
+                return
+            
+            if not self._article_data.get('title'):
+                self._article_data['title'] = title_text
+
+        if not self._article_data.get('title'):
+            meta = soup.find('meta', {'property': 'og:title'})
+            if meta: self._article_data['title'] = meta.get('content').strip()
+
+    def _extract_comments_from_html(self, soup):
+        comments = []
+        comment_wrappers = soup.find_all('div', class_='group/comment')
+        
+        if not comment_wrappers:
+            links = soup.find_all('a', href=re.compile(r'^/u/'))
+            for link in links:
+                parent = link.find_parent('div')
+                if parent and parent not in comment_wrappers:
+                    if parent.find('div', class_='whitespace-pre-wrap'):
+                        comment_wrappers.append(parent)
+
+        for wrap in comment_wrappers:
+            try:
+                user_link = wrap.find('a', href=re.compile(r'^/u/'))
+                writer_name = "Unknown"
+                if user_link:
+                    img = user_link.find('img')
+                    if img and img.get('alt'): writer_name = img.get('alt')
+                    else: writer_name = user_link.get_text(strip=True)
+
+                content_div = wrap.find('div', class_='whitespace-pre-wrap')
+                content = content_div.decode_contents() if content_div else ""
+                
+                date_str = ""
+                date_el = wrap.find(string=re.compile(r'\d{2}[\.:]\d{2}'))
+                if date_el: date_str = str(date_el).strip()
+
+                comments.append({
+                    'writer': {'display_name': writer_name},
+                    'content': content,
+                    'created_at': date_str, 
+                    'is_html_parsed': True 
+                })
+            except: pass
+            
+        return comments
 
     @property
     def name(self):
-        soup = self.soup
-        div = soup.find('h1', class_='flex')
-        if not div:
-            raise LoginRequired()
-        span = div.find_previous_sibling('span')
-        title = div.text + '_' + get_bbs_id(self.url)[1].split('?')[0]
-        # 유니코드 변환 보류
-        #title = title.replace('/', '／').replace('?', '？').replace(':', '꞉').replace(';', ';').replace('|', '￨').replace('"', '＂').replace('*', '＊').replace('<', '＜').replace('>', '＞').replace('\\', '＼').strip()
-        if span:
-            title = span.text + ' ' + title
-        else:
-            title = 'none' + ' ' + title
-        return clean_title(title)
+        if self._article_data and self._article_data.get('title'):
+             title = self._article_data.get('title')
+             bbs_id = get_bbs_id(self.url)[1].split('?')[0]
+             return clean_title(f"{title} {bbs_id}")
+        bbs_id = get_bbs_id(self.url)[1].split('?')[0]
+        return clean_title(f"{bbs_id}")
 
     def init(self):
         self.session = Session()
@@ -71,524 +372,256 @@ class Downloader_kone(Downloader):
 
     def read(self):
         self.title = tr_('읽는 중... {}').format(self.name)
-        set_imgs(self)
-        self.urls += get_imgs(self)
+        imgs = get_imgs(self) 
+        self.urls += imgs
         self.title = self.name
-        self.urls += [HTML({'referer': self.url, 'title': self.name, 'date': 10, 'p': 10}, self.soup)]
-
-class File_kone(File):
-    def alter(self):
-        return self['referer']
-
-def set_imgs(self):
-    url = self.url
-    soup = self.soup
-    view = soup.find('div', class_='prose-container')
-    style_tag = soup.new_tag('style')
-    style_tag.string = """
-/* Base typography styles */
-:host {
-color: inherit;
-font-family: inherit;
-line-height: inherit;
-}
-
-/* Content styling based on theme */
-.content {
-color: #27272a; /* zinc-800 */
-font-size: 1rem;
-line-height: 1.75;
-}
-
-.dark.content {
-color: #e4e4e7; /* zinc-200 */
-}
-
-/* Reset common elements */
-p, h1, h2, h3, h4, h5, h6 {
-margin: 0.5em 0;
-}
-
-/* Headings */
-h1 {
-font-size: 2rem;
-font-weight: 700;
-margin-top: 1.5em;
-margin-bottom: 0.5em;
-}
-
-h2 {
-font-size: 1.5rem;
-font-weight: 700;
-margin-top: 1.5em;
-margin-bottom: 0.5em;
-}
-
-h3 {
-font-size: 1.25rem;
-font-weight: 600;
-margin-top: 1.5em;
-margin-bottom: 0.5em;
-}
-
-/* Image containment */
-img {
-max-width: 100%;
-height: auto;
-margin: 1em 0;
-border-radius: 0.375em;
-}
-
-/* Table styling */
-table {
-border-collapse: collapse;
-width: 100%;
-margin: 1em 0;
-border-radius: 0.375em;
-overflow: hidden;
-}
-
-th {
-background-color: #f4f4f5; /* zinc-100 */
-font-weight: 600;
-text-align: left;
-}
-
-.dark th {
-background-color: #3f3f46; /* zinc-700 */
-}
-
-th, td {
-border: 1px solid #d4d4d8; /* zinc-300 */
-padding: 0.5em;
-}
-
-.dark th, .dark td {
-border: 1px solid #52525b; /* zinc-600 */
-padding: 0.5em;
-}
-
-/* Code blocks */
-pre {
-background-color: #18181b; /* zinc-900 */
-color: #e4e4e7; /* zinc-200 */
-padding: 1em;
-border-radius: 0.375em;
-overflow-x: auto;
-margin: 1em 0;
-font-size: 0.875rem;
-}
-
-code {
-font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-font-size: 0.875em;
-padding: 0.2em 0.4em;
-border-radius: 0.25em;
-background-color: #f4f4f5; /* zinc-100 */
-color: #18181b; /* zinc-900 */
-}
-
-.dark code {
-background-color: #3f3f46; /* zinc-700 */
-color: #e4e4e7; /* zinc-200 */
-}
-
-pre code {
-background-color: transparent;
-color: inherit;
-padding: 0;
-border-radius: 0;
-}
-
-/* Lists */
-ul, ol {
-padding-left: 1.5em;
-margin: 0.5em 0;
-}
-
-ul {
-list-style-type: disc;
-}
-
-ol {
-list-style-type: decimal;
-}
-
-li {
-margin-bottom: 0.25em;
-}
-
-li > ul, li > ol {
-margin-top: 0.25em;
-}
-
-/* Blockquotes */
-blockquote {
-border-left: 4px solid #d4d4d8; /* zinc-300 */
-margin: 1em 0;
-padding: 0.5em 0 0.5em 1em;
-color: #71717a; /* zinc-500 */
-font-style: italic;
-}
-
-.dark blockquote {
-border-left: 4px solid #52525b; /* zinc-600 */
-}
-
-/* Horizontal rule */
-hr {
-border: 0;
-border-top: 1px solid #d4d4d8; /* zinc-300 */
-margin: 2em 0;
-}
-
-.dark hr {
-border-top: 1px solid #52525b; /* zinc-600 */
-}
-
-/* Text alignment */
-.text-left {
-text-align: left;
-}
-
-.text-center {
-text-align: center;
-}
-
-.text-right {
-text-align: right;
-}
-
-/* Text formatting */
-strong, b {
-font-weight: 600;
-}
-
-em, i {
-font-style: italic;
-}
-
-u {
-text-decoration: underline;
-}
-
-s, strike, del {
-text-decoration: line-through;
-}
-
-sub, sup {
-font-size: 75%;
-line-height: 0;
-position: relative;
-vertical-align: baseline;
-}
-
-sup {
-top: -0.5em;
-}
-
-sub {
-bottom: -0.25em;
-}
-
-/* Highlight */
-mark {
-background-color: #fef9c3; /* yellow-100 */
-color: inherit;
-padding: 0.2em;
-border-radius: 0.25em;
-}
-
-.dark mark {
-background-color: #854d0e; /* yellow-800 */
-color: #fef9c3; /* yellow-100 */
-}
-
-/* Editor-specific styles */
-.ProseMirror-selectednode {
-outline: 2px solid #2563eb; /* blue-600 */
-}
-
-/* Prevent position:fixed from escaping */
-.content {
-position: relative;
-z-index: 1;
-overflow: visible;
-}
-
-/* Ensure position:fixed elements stay within shadow DOM */
-.content * {
-position: relative !important;
-z-index: auto !important;
-top: auto !important;
-left: auto !important;
-right: auto !important;
-bottom: auto !important;
-}
-
-/* Handle iframes */
-iframe {
-max-width: 100%;
-border: none;
-margin: 1em 0;
-}
-
-/* Custom styles passed in */
-
-/* Ensure proper typography for article content */
-.content {
-font-size: 1rem;
-line-height: 1.75;
-}
-
-/* Match your existing prose styles */
-.content p {
-margin: 0.5rem 0;
-}
-
-/* Light/dark mode */
-.content {
-color: #18181b;
-}
-
-@media (prefers-color-scheme: dark) {
-.content {
-color: #e4e4e7;
-}
-}
-
-/* Link styles */
-.content a {
-color: #2563eb;
-text-decoration: underline;
-}
-
-/* Fix potential sizing issues */
-.content * {
-max-width: 100%;
-}
-
-/* Prevent position:fixed from escaping */
-.content {
-position: relative;
-overflow: hidden;
-}
-    """
-    view.append(style_tag)
-    div = soup.new_tag('div')
-    #div['class'] = 'dark'
-    view.append(div)
-    view_div = view.find('div')
-    view_div.append(soup.new_tag("p"))
-    view_p = view_div.find('p')
-
-    compiled_regex = re.compile(r'self\.__next_f\.push\(\[1,\s*"(.*?)"\]\)', re.DOTALL)
-    matches_iterator = compiled_regex.finditer(str(soup))
-    raw_match_parts = []
-    for match in matches_iterator:
-        raw_match_parts.append(match.group(1))
-    combined_raw_string = "".join(raw_match_parts)
-
-    try:
-        compiled_regex = re.compile(r'\\"Article\\":(\{.*?\}),\\"Comments\\":', re.DOTALL)
-        match_object = compiled_regex.search(combined_raw_string)
-        match = match_object.group(1)
-
-        article_content_final = None
-        try:
-            article_object_string_escaped = match
-            article_object_string_escaped = re.sub(r':\s*null\b', ':None', article_object_string_escaped)
-            article_object_string_escaped = json.loads(f'"{article_object_string_escaped}"')
-            
-            import ast
-            article_data_dict = ast.literal_eval(article_object_string_escaped)
-
-            if isinstance(article_data_dict, dict):
-                content_from_dict = article_data_dict.get("content")
-
-                if content_from_dict is not None:
-                    content_after_html_decode = html.unescape(content_from_dict)
-
-                    final_content = content_after_html_decode.replace('\\n', '\n')
-                    final_content = final_content.replace('\\r', '\r')
-                    final_content = final_content.replace('\\t', '\t')
-
-                    article_content_final = final_content
-        except Exception:
-            return
-
-        if article_content_final is None:
-            return
-
-        try:
-            decode_content = article_content_final
-            decode_content = html.unescape(decode_content)
-
-            new_soup = Soup(decode_content)
-            for element in new_soup.contents[:]:
-                if isinstance(element, Tag):
-                    view_p.append(element)
-                elif element.string and element.string.strip():
-                    view_p.append(element.string)
-        except Exception:
-            view_p.append(article_content_final)
         
-        if view_p.string.startswith('$'):
-            code_str = view_p.string[1:]
-            view_p.clear()
+        info_data = self._article_data.copy() if self._article_data else {}
+        if 'title' not in info_data: info_data['title'] = self.name
+        info_data['referer'] = self.url
+        info_data['comments_list'] = self._comments_data 
+        info_data['date'] = 10
+        info_data['p'] = 10
 
-            processed_content = ""
-            try:
-                processed_content = json.loads(f'"{combined_raw_string}"')
-                processed_content = html.unescape(processed_content)
-            except Exception:
-                processed_content = combined_raw_string
-
-            compiled_regex = re.compile(rf'{code_str}:T([^,]*),')
-            match_object = compiled_regex.search(processed_content)
-            hex_length_str = match_object.group(1)
-            try:
-                data_length = int(hex_length_str, 16)
-            except ValueError:
-                return
-
-            extracted_segment = ""
-            extraction_start_index = match_object.end()
-            if extraction_start_index + data_length <= len(processed_content):
-                    extracted_segment = processed_content[extraction_start_index : extraction_start_index + data_length]
-            elif len(processed_content) - extraction_start_index > 0:
-                    extracted_segment = processed_content[extraction_start_index:]
-
-            if extracted_segment:
-                try:
-                    regex_pattern = r'[a-z]:\["\$"'
-                    raw_match = re.search(regex_pattern, extracted_segment)
-                    if raw_match:
-                        extracted_segment = extracted_segment[:raw_match.start()]
-
-                    new_soup = BeautifulSoup(extracted_segment, 'html.parser')
-                    code_blocks_to_sanitize = []
-                    for code_tag in new_soup.find_all('code'):
-                        if code_tag.parent and code_tag.parent.name == 'pre':
-                            code_blocks_to_sanitize.append(code_tag)
-
-                    for code_tag in code_blocks_to_sanitize:
-                        inner_html_of_code_tag = code_tag.decode_contents()
-                        code_tag.clear()
-                        code_tag.append(NavigableString(inner_html_of_code_tag))
-
-                    for element in new_soup.find_all(True, recursive=False):
-                        if isinstance(element, Tag):
-                            view_p.append(element)
-                        elif element.string and element.string.strip():
-                            view_p.append(NavigableString(element.string))
-                except Exception as e:
-                    view_p.append(extracted_segment)
-
-    except Exception:
-        return
-
+        self.urls += [HTML(info_data, self.soup, imgs)]
 
 def get_imgs(self):
-    soup = self.soup
+    target_soup = None
+    if hasattr(self, '_article_data') and self._article_data and self._article_data.get('content'):
+        target_soup = Soup(self._article_data['content'])
+    else:
+        target_soup = self.soup 
+
     url = self.url
     session = self.session
-    mute = soup.find('div', class_='text-muted')
-    if mute:
-        raise LoginRequired(mute.text.strip())
-
     imgs = []
     url_imgs = []
     url_imgs_set = set()
-    original_url_imgs = []
-
-    view = soup.find('div', {'class': 'prose-container'})
-    for div_rel in view.findAll('div'):
-        for div_prose in div_rel.findAll('p'):
-            for img in div_prose.findAll(['img', 'video']):
-                url_img = img.get('src') or img.get('data-originalurl')
-                if not url_img:
-                    continue
-                url_img = urljoin(url, url_img)
-                if url_img in url_imgs_set:
-                    continue
-                url_imgs.append(url_img)
-                url_imgs_set.add(url_img)
     
-    # 원본 이미지 URL을 가져오기
+    for img in target_soup.findAll(['img', 'video']):
+        url_img = img.get('src') or img.get('data-originalurl')
+        if not url_img: continue
+        
+        classes = img.get('class', [])
+        if classes and ('rounded-full' in str(classes)): continue
+            
+        url_img = urljoin(url, url_img)
+        if url_img in url_imgs_set: continue
+        
+        url_imgs.append(url_img)
+        url_imgs_set.add(url_img)
+    
+    original_url_imgs = []
     try:
         bbs_id = re.sub(r'\?.*$', '', get_bbs_id(url)[1])
         api_url = "https://api.kone.gg/v0/article/"+bbs_id+"/media/original"
         api_data = {'media_url': url_imgs}
-        api_headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36', 'Content-Type': 'application/json', 'Referer': 'https://kone.gg/' }
-        response = session.post(api_url, json=api_data, timeout=10)
+        api_headers = { 
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36', 
+            'Content-Type': 'application/json', 
+            'Referer': 'https://kone.gg/' 
+        }
+        response = session.post(api_url, json=api_data, headers=api_headers, timeout=10)
         response.raise_for_status()
         media_data = response.json()
         original_url_imgs = [media.get('url') for media in media_data.get('media', []) if media.get('url')]
-    except Exception:
-        pass
+    except: pass
 
     if len(url_imgs) != len(original_url_imgs):
         original_url_imgs = url_imgs
+        
     for i, (url_img, originla_url_img) in enumerate(zip(url_imgs, original_url_imgs)):
         ext = get_ext(originla_url_img) or ".webp"
         name = f'{i:04}{ext}'
         img = File_kone({'referer':url_img, 'url':originla_url_img, 'name':name})
         imgs.append(img)
-
     return imgs
 
+class File_kone(File):
+    def alter(self):
+        return self['referer']
+    
 class HTML(File):
     type = 'kone'
     format = 'title'
 
-    def __init__(self, info, soup):
-        info['title_all'] = info['title']
-        d = {
-            'title': info['title_all'],
-            }
+    def __init__(self, info, soup, imgs_files):
+        d = {'title': info.get('title', 'No Title')}
         info['name'] = utils.format(self.type, d, '.html')
         super().__init__(info)
+        
         self.soup = soup
-        self.referer_url = info['referer']
+        self.referer_url = info.get('referer', '')
+        self.imgs_files = imgs_files 
+        self.comments = info.get('comments_list', [])
 
-    def get(self):
-        # css
-        link_href = self.soup.find('link', {'rel': 'stylesheet'})
-        link_url = "https://kone.gg" + link_href.get('href')
-        html = clf2.solve(link_url, session=self.session)['html']
-        new_style = self.soup.new_tag('style')
-        new_style.string = html
-        self.soup.find('main', class_='flex').find('div', class_='mx-auto').append(new_style)
+    def get(self, *args):
+        # 1. Lookup mode (for utils compatibility)
+        if args:
+            key = args[0]
+            default = args[1] if len(args) > 1 else None
+            try: return self[key]
+            except: return default
         
-        imgs = []
-        processed_tags = set()
+        # 2. HTML Generation mode
+        def safe_get(k, d=''):
+            try: return self[k]
+            except: return d
 
-        style_str = """<html lang="ko" class="light"><head><body class="" style="">"""
-        style_end_str = """</body></head></html>"""
-
-        view = self.soup.find('div', {'class': 'prose-container'})
-        for div_rel in view.findAll('div'):
-            for div_prose in div_rel.findAll('p'):
-                for img in div_prose.findAll(['img', 'video']):
-                    if img in processed_tags:
-                        continue
-                    url_img = img.get('src') or img.get('data-originalurl')
-                    original_attr = 'src' if img.get('src') else 'data-originalurl' # 원본 속성 저장
-                    ext = get_ext(url_img)
-                    ext = ext if ext else '.webp' # 확장자 없을 경우 기본값 설정
-                    name = f'{len(imgs):04}{ext}'
-                    img[original_attr] = name
-                    imgs.append(url_img)
-                    processed_tags.add(img)
+        title = safe_get('title', 'No Title')
+        writer_data = safe_get('writer', {})
+        if not isinstance(writer_data, dict): writer_data = {}
         
-        text_tag = self.soup.find('main', class_='flex').find('div', class_='mx-auto')
-        cleaned_text_str = str(text_tag)
-        cleaned_text_str = cleaned_text_str.replace('amp;', '')
-        cleaned_text_str = style_str + cleaned_text_str + style_end_str
+        writer_name = writer_data.get('display_name', 'Unknown')
+        writer_handle = writer_data.get('handle', '')
+        views = safe_get('views', 0)
+        votes = safe_get('votes', 0)
+        
+        raw_date = safe_get('created_at', '')
+        date_str = raw_date
+        try:
+            if raw_date:
+                dt = datetime.datetime.fromisoformat(raw_date.replace('Z', '+00:00'))
+                date_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+        except: pass
+
+        sub_id = safe_get('sub_id', 'somisoft')
+
+        # Render Comments
+        def render_comments(comments):
+            if not comments: return '<div class="p-4 text-sm text-zinc-500">댓글이 없습니다.</div>'
+            
+            html_parts = []
+            html_parts.append(f'<div class="p-4 md:px-6"><h2 class="text-lg font-medium mb-3">댓글 {len(comments)}개</h2>')
+            
+            for c in comments:
+                c_writer = c.get('writer', {})
+                c_name = c_writer.get('display_name', 'Unknown')
+                c_content = c.get('content', '')
+                
+                c_date = c.get('created_at', '')
+                if not c.get('is_html_parsed'):
+                    try:
+                        if c_date:
+                            dt = datetime.datetime.fromisoformat(c_date.replace('Z', '+00:00'))
+                            c_date = dt.strftime('%m.%d %H:%M')
+                    except: pass
+                
+                indent_class = "reply-indent" if c.get('parent_id') else ""
+                initial = c_name[0] if c_name else '?'
+
+                html_parts.append(f"""
+                <div class="comment-item {indent_class}">
+                    <div class="flex items-start gap-2">
+                        <div class="comment-avatar-box">
+                            {initial}
+                        </div>
+                        <div class="flex-1">
+                            <div class="flex items-end gap-2 mb-1">
+                                <span class="text-sm font-medium">{c_name}</span>
+                                <span class="text-xs text-zinc-500">{c_date}</span>
+                            </div>
+                            <div class="comment-content">
+                                {c_content}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                """)
+            
+            html_parts.append('</div>')
+            return "".join(html_parts)
+
+        comments_html = render_comments(self.comments)
+
+        html_template = f"""
+        <html lang="ko" class="light">
+        <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>{title}</title>
+        </head>
+        <body class="bg-[#fcfcfc] dark:bg-zinc-900">
+            <div class="container mx-auto">
+                <style>{KONE_CSS}</style>
+                
+                <div class="contents">
+                    <div class="pb-4 pt-2 pl-6 pr-3">
+                        <div class="mb-3 flex justify-between items-center gap-2">
+                            <div class="flex flex-col md:flex-row gap-1 md:gap-2 md:items-center">
+                                <span class="badge">
+                                    <div class="mt-[1px]">{sub_id}</div>
+                                </span>
+                                <h1 class="flex items-center gap-1.5 py-2 text-2xl font-bold">
+                                    {title}
+                                </h1>
+                            </div>
+                        </div>
+                        <div class="flex items-end justify-between">
+                            <div class="flex items-center gap-3">
+                                <div class="rounded-full bg-zinc-700 h-10 w-10 flex items-center justify-center text-zinc-50 font-bold">
+                                    {writer_name[0] if writer_name else 'U'}
+                                </div>
+                                <div class="flex flex-col gap-1">
+                                    <div class="flex items-center gap-1 text-sm font-medium">
+                                        <span>{writer_name}</span> 
+                                        <span class="text-xs text-zinc-400">(@{writer_handle})</span>
+                                    </div>
+                                    <div class="text-xs text-zinc-400">{date_str}</div>
+                                </div>
+                            </div>
+                            <div class="text-xs text-zinc-400">
+                                조회 {views} · 좋아요 {votes}
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <hr style="border-color: #eee; margin: 10px 0;">
+
+                    <div class="relative min-h-60">
+                        <div class="p-4 md:p-6">
+                            <div id="post_content" class="prose-container content">
+                            </div>
+                        </div>
+                    </div>
+
+                    <hr style="border-color: #eee; margin: 10px 0;">
+
+                    <div class="comment-section">
+                        {comments_html}
+                    </div>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        doc = BeautifulSoup(html_template, 'html.parser')
+        content_container = doc.find(id='post_content')
+        
+        content_clone = BeautifulSoup(str(self.soup), 'html.parser')
+        if content_clone:
+            target = content_clone.body.contents if content_clone.body else content_clone.contents
+            for element in list(target):
+                content_container.append(element)
+
+        url_map = {}
+        for file_obj in self.imgs_files:
+            url_map[file_obj['referer']] = file_obj['name']
+
+        for tag in content_container.find_all(['img', 'video']):
+            original_src = tag.get('src') or tag.get('data-originalurl')
+            if not original_src: continue
+            
+            abs_src = urljoin(self.referer_url, original_src)
+            
+            if abs_src in url_map:
+                tag['src'] = url_map[abs_src]
+                for attr in ['srcset', 'loading', 'data-originalurl', 'style', 'sizes', 'class']:
+                    if tag.has_attr(attr): del tag[attr]
 
         f = BytesIO()
-        f.write(cleaned_text_str.encode('utf8')) # 수정된 문자열을 인코딩하여 저장
+        f.write(str(doc).encode('utf-8'))
         f.seek(0)
         return {'url': f}
 
