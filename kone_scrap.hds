@@ -206,14 +206,7 @@ class Downloader_kone(Downloader):
             js_check = """
             (() => {
                 const n = self.__next_f || window.__NEXT_DATA__;
-                if (!n) return { count: 0, has_article: false };
-                let found = false;
-                for (let i = 0; i < n.length; i++) {
-                    if (n[i] && typeof n[i][1] === 'string' && n[i][1].includes('"Article":')) {
-                        found = true; break;
-                    }
-                }
-                return { count: n.length, has_article: found };
+                return n ? n.length : 0;
             })()
             """
             
@@ -229,41 +222,52 @@ class Downloader_kone(Downloader):
 
             def f(html, browser=None):
                 nonlocal token
-                last_count = -1
+                last_len = -1
                 stable_cycles = 0
-                REQUIRED_STABILITY = 6 
+                REQUIRED_STABILITY = 6
 
-                for _ in range(120):
-                    status = None
-                    def check_cb(r): nonlocal status; status = r
+                for _ in range(180):
+                    curr_len = 0
+                    def check_cb(r): nonlocal curr_len; curr_len = r
                     browser.runJavaScript(js_check, callback=check_cb)
                     time.sleep(0.5)
                     
-                    if status:
-                        curr_count = status.get('count', 0)
-                        has_article = status.get('has_article', False)
+                    if curr_len > 0 and curr_len == last_len:
+                        stable_cycles += 1
+                    else:
+                        stable_cycles = 0
+                        last_len = curr_len
+                    
+                    if stable_cycles >= REQUIRED_STABILITY:
+                        temp_token = None
+                        def fetch_cb(r): nonlocal temp_token; temp_token = r
+                        browser.runJavaScript(js_fetch, callback=fetch_cb)
                         
-                        if has_article:
-                            if curr_count == last_count:
-                                stable_cycles += 1
-                            else:
-                                stable_cycles = 0
-                                last_count = curr_count
+                        for _ in range(5):
+                            if temp_token: break
+                            time.sleep(0.2)
+                        
+                        if temp_token: # merge 
+                            raw_data = temp_token.get('data', [])
+                            full_str = ""
+                            for item in raw_data:
+                                if len(item) >= 2 and isinstance(item[1], str):
+                                    full_str += item[1]
                             
-                            if stable_cycles >= REQUIRED_STABILITY:
-                                break
+                            if '"Article":' in full_str:
+                                token = temp_token
+                                browser.hide()
+                                return True
+                            else:
+                                stable_cycles = 0 # more?
                 
-                def fetch_cb(r): nonlocal token; token = r
-                browser.runJavaScript(js_fetch, callback=fetch_cb)
+                if not token and 'temp_token' in locals() and temp_token:
+                    token = temp_token
                 
-                for _ in range(10):
-                    if token: break
-                    time.sleep(0.5)
-
                 browser.hide()
                 return True
 
-            res = clf2.solve(self.url, f=f, session=self.session)
+            res = clf2.solve(self.url, f=f, session=self.session, timeout=186)
             
             if not token or not isinstance(token, dict):
                 self._soup = Soup(res['html'])
@@ -306,7 +310,6 @@ class Downloader_kone(Downloader):
         if h1:
             title_text = h1.get_text(strip=True)
             badge = h1.find_previous_sibling('span', attrs={'data-slot': 'badge'})
-
             if badge:
                 cat_name = badge.get_text(strip=True)
                 self._article_data['title'] = f"[{cat_name}] {title_text}"
@@ -364,7 +367,7 @@ class Downloader_kone(Downloader):
              bbs_id = get_bbs_id(self.url)[1].split('?')[0]
              return clean_title(f"{title} {bbs_id}")
         bbs_id = get_bbs_id(self.url)[1].split('?')[0]
-        return clean_title(f"{bbs_id}")
+        return clean_title(f"No_Title_{bbs_id}")
 
     def init(self):
         self.session = Session()
