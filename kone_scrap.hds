@@ -1,5 +1,5 @@
 #coding: utf8
-#title: kone 사이트 추가
+#title: kone.gg
 #comment: https://kone.gg
 
 import downloader
@@ -22,7 +22,7 @@ body { margin: 0; padding: 0; background-color: #fff; color: #27272a; font-famil
 * { box-sizing: border-box; }
 a { text-decoration: none; color: inherit; }
 
-/* Layout Utilities */
+/* Layout */
 .container { width: 100%; max-width: 1200px; margin: 0 auto; padding: 20px; }
 .flex { display: flex; }
 .flex-col { flex-direction: column; }
@@ -80,12 +80,12 @@ h1 { margin: 0; display: inline; vertical-align: middle; }
 .reply-indent { margin-left: 2rem; border-left: 2px solid #f4f4f5; padding-left: 0.5rem; }
 
 /* Dark Mode */
-@media (prefers-color-scheme: dark) {
-    body { background-color: #18181b; color: #e4e4e7; }
-    .prose-container { color: #e4e4e7; }
-    .comment-content { color: #e4e4e7; }
-    .comment-section { border-top-color: #3f3f46; }
-    .comment-item:hover { background-color: #27272a; }
+@media (prefers-color-scheme: dark) { 
+    body { background-color: #18181b; color: #e4e4e7; } 
+    .prose-container { color: #e4e4e7; } 
+    .comment-content { color: #e4e4e7; } 
+    .comment-section { border-top-color: #3f3f46; } 
+    .comment-item:hover { background-color: #27272a; } 
 }
 """
 
@@ -99,6 +99,36 @@ def get_bbs_id(url):
         id = url.split('/')[5]
     return bbs, id
 
+# Extract data variables directly from HTML string (Regex)
+def parse_nextjs_script_from_html(html):
+    if not html: return []
+    data_list = []
+    
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        scripts = soup.find_all('script')
+        
+        for script in scripts:
+            if not script.string: continue
+            content = script.string.strip()
+            
+            # Find self.__next_f.push(...) pattern
+            if 'self.__next_f' in content and '.push(' in content:
+                try:
+                    # Cleanup trailing characters if JSON parsing fails
+                    start_idx = content.find('(')
+                    end_idx = content.rfind(')')
+                    if start_idx != -1 and end_idx != -1:
+                        json_str = content[start_idx+1 : end_idx]
+                        item = json.loads(json_str)
+                        if isinstance(item, list):
+                            data_list.append(item)
+                except: pass
+    except: pass
+    
+    return data_list
+
+# Parse extracted data list (Concatenate + JSON extraction)
 def parse_nextjs_data(next_f_data):
     if not next_f_data: return None
     
@@ -108,21 +138,27 @@ def parse_nextjs_data(next_f_data):
         if len(item) >= 2 and isinstance(item[1], str):
             full_raw_string += item[1]
 
+    # Encoding for byte-level processing
+    full_bytes = full_raw_string.encode('utf-8')
+
     chunk_map = {}       
     parsed_result = {'article': None, 'comments': []}
 
-    # Extract HTML chunks
-    matches = re.finditer(r'(\d+):T([0-9a-fA-F]+),', full_raw_string)
+    # Extract HTML chunks (Byte-based regex)
+    matches = re.finditer(rb'(\d+):T([0-9a-fA-F]+),', full_bytes)
+    
     for match in matches:
         try:
-            chunk_id = match.group(1)
+            chunk_id = match.group(1).decode('utf-8')
             data_len = int(match.group(2), 16)
             start_idx = match.end()
-            if start_idx + data_len <= len(full_raw_string):
-                chunk_content = full_raw_string[start_idx : start_idx + data_len]
+            
+            if start_idx + data_len <= len(full_bytes):
+                chunk_bytes = full_bytes[start_idx : start_idx + data_len]
+                chunk_content = chunk_bytes.decode('utf-8')
                 chunk_map[chunk_id] = chunk_content
             else:
-                chunk_content = full_raw_string[start_idx:]
+                chunk_content = full_bytes[start_idx:].decode('utf-8', errors='ignore')
                 chunk_map[chunk_id] = chunk_content
         except: pass
 
@@ -130,6 +166,8 @@ def parse_nextjs_data(next_f_data):
     if '"Article":' in full_raw_string:
         lines = full_raw_string.split('\n')
         for line in lines:
+            if '"Article":' not in line: continue
+            
             json_match = re.search(r'(\d+):([\[\{].*)', line)
             if json_match:
                 json_candidate = json_match.group(2)
@@ -137,7 +175,7 @@ def parse_nextjs_data(next_f_data):
                 try:
                     parsed = json.loads(json_candidate)
                 except json.JSONDecodeError:
-                    # Smart parsing: trimming trailing garbage characters
+                    # Smart Parsing: Match trailing brackets
                     try:
                         last_brace = max(json_candidate.rfind('}'), json_candidate.rfind(']'))
                         if last_brace != -1:
@@ -174,13 +212,13 @@ def parse_nextjs_data(next_f_data):
             if ref_id in chunk_map:
                 parsed_result['article']['content'] = chunk_map[ref_id]
         return parsed_result
-
-    # Fallback return
+    
+    # Fallback
     if chunk_map:
         longest_chunk = max(chunk_map.values(), key=len)
         fake_article = {'title': 'Unknown', 'content': longest_chunk, 'writer': {'display_name': 'Unknown'}}
         return {'article': fake_article, 'comments': []}
-        
+
     return None
 
 class Downloader_kone(Downloader):
@@ -200,116 +238,48 @@ class Downloader_kone(Downloader):
     @property
     def soup(self):
         if self._soup is None:
-            token = None
+            # Get HTML source directly (No JS execution wait)
+            res = clf2.solve(self.url, session=self.session)
+            html_source = res['html']
+
+            # Manual Hydration from HTML text
+            simulated_next_data = parse_nextjs_script_from_html(html_source)
             
-            # Check data stability
-            js_check = """
-            (() => {
-                const n = self.__next_f || window.__NEXT_DATA__;
-                return n ? n.length : 0;
-            })()
-            """
+            # Parse assembled data
+            parsed = parse_nextjs_data(simulated_next_data)
             
-            # Fetch data
-            js_fetch = """
-            (() => {
-                return {
-                    html: document.documentElement.outerHTML,
-                    data: self.__next_f || window.__NEXT_DATA__ || []
-                };
-            })()
-            """
+            full_soup = Soup(html_source)
 
-            def f(html, browser=None):
-                nonlocal token
-                last_len = -1
-                stable_cycles = 0
-                REQUIRED_STABILITY = 6
-
-                for _ in range(180):
-                    curr_len = 0
-                    def check_cb(r): nonlocal curr_len; curr_len = r
-                    browser.runJavaScript(js_check, callback=check_cb)
-                    time.sleep(0.5)
-                    
-                    if curr_len > 0 and curr_len == last_len:
-                        stable_cycles += 1
-                    else:
-                        stable_cycles = 0
-                        last_len = curr_len
-                    
-                    if stable_cycles >= REQUIRED_STABILITY:
-                        temp_token = None
-                        def fetch_cb(r): nonlocal temp_token; temp_token = r
-                        browser.runJavaScript(js_fetch, callback=fetch_cb)
-                        
-                        for _ in range(5):
-                            if temp_token: break
-                            time.sleep(0.2)
-                        
-                        if temp_token: # merge 
-                            raw_data = temp_token.get('data', [])
-                            full_str = ""
-                            for item in raw_data:
-                                if len(item) >= 2 and isinstance(item[1], str):
-                                    full_str += item[1]
-                            
-                            if '"Article":' in full_str:
-                                token = temp_token
-                                browser.hide()
-                                return True
-                            else:
-                                stable_cycles = 0 # more?
-                
-                if not token and 'temp_token' in locals() and temp_token:
-                    token = temp_token
-                
-                browser.hide()
-                return True
-
-            res = clf2.solve(self.url, f=f, session=self.session, timeout=186)
-            
-            if not token or not isinstance(token, dict):
-                self._soup = Soup(res['html'])
-                self._save_info_from_soup(self._soup)
-                return self._soup
-
-            next_f_data = token.get('data')
-            hydrated_html = token.get('html')
-
-            parsed = parse_nextjs_data(next_f_data)
-            
             if parsed and parsed.get('article'):
                 self._article_data = parsed['article']
                 self._comments_data = parsed.get('comments', [])
+                
                 content_html = self._article_data.get('content', '')
                 self._soup = Soup(content_html)
-
-                if hydrated_html:
-                    self._save_info_from_soup(Soup(hydrated_html))
                 
-                if not self._comments_data and hydrated_html:
-                    self._comments_data = self._extract_comments_from_html(Soup(hydrated_html))
+                # Fallback: Extract comments from HTML if JSON is empty
+                if not self._comments_data:
+                    self._comments_data = self._extract_comments_from_html(full_soup)
 
-            elif hydrated_html:
-                full_soup = Soup(hydrated_html)
-                self._save_info_from_soup(full_soup)
-                self._comments_data = self._extract_comments_from_html(full_soup)
+            else:
+                # Fallback: HTML DOM Parsing
                 content_div = full_soup.find('div', class_='prose-container') or full_soup.find('main')
                 self._soup = content_div if content_div else full_soup
-            else:
-                self._soup = Soup(res['html'])
-                self._save_info_from_soup(self._soup)
-                
+                self._comments_data = self._extract_comments_from_html(full_soup)
+
+            self._save_info_from_soup(full_soup)
+
         return self._soup
 
     def _save_info_from_soup(self, soup):
         if not self._article_data: self._article_data = {}
-
+        
+        # Title Extraction (h1 + badge)
         h1 = soup.find('h1', class_='flex')
         if h1:
             title_text = h1.get_text(strip=True)
             badge = h1.find_previous_sibling('span', attrs={'data-slot': 'badge'})
+            
             if badge:
                 cat_name = badge.get_text(strip=True)
                 self._article_data['title'] = f"[{cat_name}] {title_text}"
@@ -318,6 +288,7 @@ class Downloader_kone(Downloader):
             if not self._article_data.get('title'):
                 self._article_data['title'] = title_text
 
+        # Meta Tag Fallback
         if not self._article_data.get('title'):
             meta = soup.find('meta', {'property': 'og:title'})
             if meta: self._article_data['title'] = meta.get('content').strip()
@@ -357,7 +328,6 @@ class Downloader_kone(Downloader):
                     'is_html_parsed': True 
                 })
             except: pass
-            
         return comments
 
     @property
@@ -367,7 +337,7 @@ class Downloader_kone(Downloader):
              bbs_id = get_bbs_id(self.url)[1].split('?')[0]
              return clean_title(f"{title} {bbs_id}")
         bbs_id = get_bbs_id(self.url)[1].split('?')[0]
-        return clean_title(f"No_Title_{bbs_id}")
+        return clean_title(f"{bbs_id}")
 
     def init(self):
         self.session = Session()
@@ -390,6 +360,7 @@ class Downloader_kone(Downloader):
 
 def get_imgs(self):
     target_soup = None
+    # Use specific content if available to exclude profile images
     if hasattr(self, '_article_data') and self._article_data and self._article_data.get('content'):
         target_soup = Soup(self._article_data['content'])
     else:
@@ -405,6 +376,7 @@ def get_imgs(self):
         url_img = img.get('src') or img.get('data-originalurl')
         if not url_img: continue
         
+        # Fallback filtering
         classes = img.get('class', [])
         if classes and ('rounded-full' in str(classes)): continue
             
@@ -462,14 +434,14 @@ class HTML(File):
         self.comments = info.get('comments_list', [])
 
     def get(self, *args):
-        # 1. Lookup mode (for utils compatibility)
+        # Lookup mode
         if args:
             key = args[0]
             default = args[1] if len(args) > 1 else None
             try: return self[key]
             except: return default
         
-        # 2. HTML Generation mode
+        # HTML Generation mode
         def safe_get(k, d=''):
             try: return self[k]
             except: return d
@@ -493,7 +465,6 @@ class HTML(File):
 
         sub_id = safe_get('sub_id', 'somisoft')
 
-        # Render Comments
         def render_comments(comments):
             if not comments: return '<div class="p-4 text-sm text-zinc-500">댓글이 없습니다.</div>'
             
