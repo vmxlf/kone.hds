@@ -10,596 +10,418 @@ import clf2
 from io import BytesIO
 import re
 import json
-import html as html_module
-import time
 import datetime
-from bs4 import Tag, NavigableString, BeautifulSoup 
-
-# [CSS Styles]
-KONE_CSS = """
-/* Reset & Base */
-body { margin: 0; padding: 0; background-color: #fff; color: #27272a; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; line-height: 1.5; }
-* { box-sizing: border-box; }
-a { text-decoration: none; color: inherit; }
-
-/* Layout */
-.container { width: 100%; max-width: 1200px; margin: 0 auto; padding: 20px; }
-.flex { display: flex; }
-.flex-col { flex-direction: column; }
-.items-center { align-items: center; }
-.items-end { align-items: flex-end; }
-.items-start { align-items: flex-start; }
-.justify-between { justify-content: space-between; }
-.gap-1 { gap: 0.25rem; }
-.gap-2 { gap: 0.5rem; }
-.gap-3 { gap: 0.75rem; }
-.mb-3 { margin-bottom: 0.75rem; }
-.pb-4 { padding-bottom: 1rem; }
-.pt-2 { padding-top: 0.5rem; }
-.pl-6 { padding-left: 1.5rem; }
-.pr-3 { padding-right: 0.75rem; }
-.p-4 { padding: 1rem; }
-
-/* Typography */
-.text-2xl { font-size: 1.5rem; line-height: 2rem; }
-.font-bold { font-weight: 700; }
-.font-medium { font-weight: 500; }
-.text-sm { font-size: 0.875rem; line-height: 1.25rem; }
-.text-xs { font-size: 0.75rem; line-height: 1rem; }
-.text-zinc-400 { color: #a1a1aa; }
-.text-zinc-500 { color: #71717a; }
-.text-zinc-50 { color: #fafafa; }
-.bg-zinc-700 { background-color: #3f3f46; }
-.bg-zinc-100 { background-color: #f4f4f5; }
-.rounded-full { border-radius: 9999px; }
-.rounded-lg { border-radius: 0.5rem; }
-
-/* Badge & Header */
-.badge { display: inline-flex; align-items: center; justify-content: center; background-color: #3f3f46; color: white; border-radius: 9999px; padding: 2px 8px; font-size: 0.75rem; font-weight: 600; margin-right: 8px; vertical-align: middle; }
-h1 { margin: 0; display: inline; vertical-align: middle; }
-
-/* Content Body */
-.prose-container { margin-top: 20px; font-size: 1rem; line-height: 1.75; color: #27272a; }
-.prose-container img, .prose-container video { 
-    max-width: 100% !important; 
-    height: auto !important; 
-    display: block !important; 
-    margin: 10px auto !important; 
-    border-radius: 8px; 
-    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); 
-}
-.prose-container p { margin-bottom: 1em; }
-
-/* Comments */
-.comment-section { margin-top: 3rem; border-top: 1px solid #e4e4e7; padding-top: 1rem; }
-.comment-item { margin-bottom: 1rem; padding: 0.5rem; border-radius: 0.5rem; }
-.comment-avatar-box { width: 1.5rem; height: 1.5rem; border-radius: 9999px; background-color: #e4e4e7; flex-shrink: 0; overflow: hidden; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 0.75rem;}
-.comment-avatar-box img { width: 100%; height: 100%; object-fit: cover; }
-.comment-content { font-size: 0.9rem; white-space: pre-wrap; word-break: break-word; margin-top: 0.25rem; color: #333; }
-.comment-image { max-width: 200px; max-height: 200px; display: block; margin: 5px 0; border-radius: 4px; }
-.reply-indent { margin-left: 2rem; border-left: 2px solid #f4f4f5; padding-left: 0.5rem; }
-
-/* Dark Mode */
-@media (prefers-color-scheme: dark) { 
-    body { background-color: #18181b; color: #e4e4e7; } 
-    .prose-container { color: #e4e4e7; } 
-    .comment-content { color: #e4e4e7; } 
-    .comment-section { border-top-color: #3f3f46; } 
-    .comment-item:hover { background-color: #27272a; } 
-}
-"""
+import traceback
 
 class LoginRequired(errors.LoginRequired):
     def __init__(self, *args):
         super().__init__(*args, method='browser', url='https://kone.gg/account/signin?path=%2F')
 
-def get_bbs_id(url):
+def get_post_id(url):
     if '/s/' in url:
-        bbs = url.split('/')[4]
-        id = url.split('/')[5]
-    return bbs, id
-
-# Extract data variables directly from HTML string (Regex)
-def parse_nextjs_script_from_html(html):
-    if not html: return []
-    data_list = []
-    
-    try:
-        soup = BeautifulSoup(html, 'html.parser')
-        scripts = soup.find_all('script')
-        
-        for script in scripts:
-            if not script.string: continue
-            content = script.string.strip()
-            
-            # Find self.__next_f.push(...) pattern
-            if 'self.__next_f' in content and '.push(' in content:
-                try:
-                    # Cleanup trailing characters if JSON parsing fails
-                    start_idx = content.find('(')
-                    end_idx = content.rfind(')')
-                    if start_idx != -1 and end_idx != -1:
-                        json_str = content[start_idx+1 : end_idx]
-                        item = json.loads(json_str)
-                        if isinstance(item, list):
-                            data_list.append(item)
-                except: pass
-    except: pass
-    
-    return data_list
-
-# Parse extracted data list (Concatenate + JSON extraction)
-def parse_nextjs_data(next_f_data):
-    if not next_f_data: return None
-    
-    # Merge split chunks
-    full_raw_string = ""
-    for item in next_f_data:
-        if len(item) >= 2 and isinstance(item[1], str):
-            full_raw_string += item[1]
-
-    # Encoding for byte-level processing
-    full_bytes = full_raw_string.encode('utf-8')
-
-    chunk_map = {}       
-    parsed_result = {'article': None, 'comments': []}
-
-    # Extract HTML chunks (Byte-based regex)
-    matches = re.finditer(rb'(\d+):T([0-9a-fA-F]+),', full_bytes)
-    
-    for match in matches:
         try:
-            chunk_id = match.group(1).decode('utf-8')
-            data_len = int(match.group(2), 16)
-            start_idx = match.end()
-            
-            if start_idx + data_len <= len(full_bytes):
-                chunk_bytes = full_bytes[start_idx : start_idx + data_len]
-                chunk_content = chunk_bytes.decode('utf-8')
-                chunk_map[chunk_id] = chunk_content
-            else:
-                chunk_content = full_bytes[start_idx:].decode('utf-8', errors='ignore')
-                chunk_map[chunk_id] = chunk_content
+            parts = url.split('/')
+            return parts[5].split('?')[0]
         except: pass
-
-    # Extract JSON Data (Article & Comments)
-    if '"Article":' in full_raw_string:
-        lines = full_raw_string.split('\n')
-        for line in lines:
-            if '"Article":' not in line: continue
-            
-            json_match = re.search(r'(\d+):([\[\{].*)', line)
-            if json_match:
-                json_candidate = json_match.group(2)
-                parsed = None
-                try:
-                    parsed = json.loads(json_candidate)
-                except json.JSONDecodeError:
-                    # Smart Parsing: Match trailing brackets
-                    try:
-                        last_brace = max(json_candidate.rfind('}'), json_candidate.rfind(']'))
-                        if last_brace != -1:
-                            parsed = json.loads(json_candidate[:last_brace+1])
-                    except: pass
-                
-                if parsed:
-                    def find_key(obj, key):
-                        if isinstance(obj, dict):
-                            if key in obj: return obj[key]
-                            for v in obj.values():
-                                res = find_key(v, key)
-                                if res: return res
-                        elif isinstance(obj, list):
-                            for v in obj:
-                                res = find_key(v, key)
-                                if res: return res
-                        return None
-
-                    if not parsed_result['article']:
-                        art = find_key(parsed, 'Article')
-                        if art: parsed_result['article'] = art
-                    
-                    if not parsed_result['comments']:
-                        coms = find_key(parsed, 'Comments')
-                        if coms and isinstance(coms, list):
-                            parsed_result['comments'] = coms
-
-    # Merge chunks into content
-    if parsed_result['article']:
-        content_ref = parsed_result['article'].get('content')
-        if isinstance(content_ref, str) and content_ref.startswith('$'):
-            ref_id = content_ref[1:]
-            if ref_id in chunk_map:
-                parsed_result['article']['content'] = chunk_map[ref_id]
-        return parsed_result
-    
-    # Fallback
-    if chunk_map:
-        longest_chunk = max(chunk_map.values(), key=len)
-        fake_article = {'title': 'Unknown', 'content': longest_chunk, 'writer': {'display_name': 'Unknown'}}
-        return {'article': fake_article, 'comments': []}
-
     return None
+
+# [CSS]
+KONE_CLEAN_CSS = """
+    :root { --bg-primary: #18181b; --bg-secondary: #27272a; --text-primary: #e4e4e7; --text-secondary: #a1a1aa; --accent: #3b82f6; --border: #3f3f46; }
+    body { margin: 0; padding: 0; background-color: var(--bg-primary); color: var(--text-primary); font-family: Pretendard, -apple-system, BlinkMacSystemFont, system-ui, Roboto, sans-serif; line-height: 1.6; }
+    .layout { max-width: 900px; margin: 0 auto; padding: 40px 20px; min-height: 100vh; }
+    header { border-bottom: 1px solid var(--border); padding-bottom: 20px; margin-bottom: 30px; }
+    .badge { display: inline-block; background: var(--bg-secondary); color: var(--text-secondary); padding: 2px 8px; border-radius: 9999px; font-size: 12px; font-weight: 600; margin-bottom: 10px; border: 1px solid var(--border); }
+    h1 { margin: 0 0 10px 0; font-size: 24px; font-weight: 700; line-height: 1.4; color: #fff; }
+    .meta { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text-secondary); }
+    .avatar { width: 24px; height: 24px; border-radius: 50%; background: var(--bg-secondary); display: flex; align-items: center; justify-content: center; font-weight: bold; overflow: hidden; color: #fff; font-size: 12px; }
+    .prose { font-size: 16px; margin-bottom: 40px; word-break: break-all; }
+    .prose img { max-width: 100%; height: auto; display: block; margin: 20px auto; border-radius: 8px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3); }
+    .comments-section { margin-top: 50px; border-top: 1px solid var(--border); padding-top: 30px; }
+    .comments-header { font-size: 18px; font-weight: 600; margin-bottom: 20px; color: #fff; }
+    .comment-item { display: flex; gap: 12px; margin-bottom: 15px; padding: 12px; background-color: var(--bg-secondary); border-radius: 8px; }
+    .comment-avatar { width: 32px; height: 32px; border-radius: 50%; background: #52525b; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 12px; color: #fff; overflow: hidden; }
+    .comment-avatar img { width: 100%; height: 100%; object-fit: cover; }
+    .comment-body { flex: 1; min-width: 0; }
+    .comment-meta { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+    .comment-author { font-size: 14px; font-weight: 600; color: #fff; }
+    .comment-date { font-size: 12px; color: var(--text-secondary); }
+    .comment-text { font-size: 14px; color: var(--text-primary); white-space: pre-wrap; word-break: break-word; }
+"""
 
 class Downloader_kone(Downloader):
     type = 'kone'
     URLS = ['kone.gg']
     icon = 'https://kone.gg/images/sub_icon.png'
     ACCEPT_COOKIES = [r'(.*\.)?kone\.gg']
-    _soup = None
-    _article_data = None 
-    _comments_data = [] 
-
-    @property
-    def id(self):
-        board, channel = get_bbs_id(self.url)
-        return 'kone_{}_{}'.format(board, channel)
-
-    @property
-    def soup(self):
-        if self._soup is None:
-            # Get HTML source directly (No JS execution wait)
-            res = clf2.solve(self.url, session=self.session)
-            html_source = res['html']
-
-            # Manual Hydration from HTML text
-            simulated_next_data = parse_nextjs_script_from_html(html_source)
-            
-            # Parse assembled data
-            parsed = parse_nextjs_data(simulated_next_data)
-            
-            full_soup = Soup(html_source)
-
-            if parsed and parsed.get('article'):
-                self._article_data = parsed['article']
-                self._comments_data = parsed.get('comments', [])
-                
-                content_html = self._article_data.get('content', '')
-                self._soup = Soup(content_html)
-                
-                # Fallback: Extract comments from HTML if JSON is empty
-                if not self._comments_data:
-                    self._comments_data = self._extract_comments_from_html(full_soup)
-
-            else:
-                # Fallback: HTML DOM Parsing
-                content_div = full_soup.find('div', class_='prose-container') or full_soup.find('main')
-                self._soup = content_div if content_div else full_soup
-                self._comments_data = self._extract_comments_from_html(full_soup)
-
-            self._save_info_from_soup(full_soup)
-
-        return self._soup
-
-    def _save_info_from_soup(self, soup):
-        if not self._article_data: self._article_data = {}
-        
-        # Title Extraction (h1 + badge)
-        h1 = soup.find('h1', class_='flex')
-        if h1:
-            title_text = h1.get_text(strip=True)
-            badge = h1.find_previous_sibling('span', attrs={'data-slot': 'badge'})
-            
-            if badge:
-                cat_name = badge.get_text(strip=True)
-                self._article_data['title'] = f"[{cat_name}] {title_text}"
-                return
-            
-            if not self._article_data.get('title'):
-                self._article_data['title'] = title_text
-
-        # Meta Tag Fallback
-        if not self._article_data.get('title'):
-            meta = soup.find('meta', {'property': 'og:title'})
-            if meta: self._article_data['title'] = meta.get('content').strip()
-
-    def _extract_comments_from_html(self, soup):
-        comments = []
-        comment_wrappers = soup.find_all('div', class_='group/comment')
-        
-        if not comment_wrappers:
-            links = soup.find_all('a', href=re.compile(r'^/u/'))
-            for link in links:
-                parent = link.find_parent('div')
-                if parent and parent not in comment_wrappers:
-                    if parent.find('div', class_='whitespace-pre-wrap'):
-                        comment_wrappers.append(parent)
-
-        for wrap in comment_wrappers:
-            try:
-                user_link = wrap.find('a', href=re.compile(r'^/u/'))
-                writer_name = "Unknown"
-                if user_link:
-                    img = user_link.find('img')
-                    if img and img.get('alt'): writer_name = img.get('alt')
-                    else: writer_name = user_link.get_text(strip=True)
-
-                content_div = wrap.find('div', class_='whitespace-pre-wrap')
-                content = content_div.decode_contents() if content_div else ""
-                
-                date_str = ""
-                date_el = wrap.find(string=re.compile(r'\d{2}[\.:]\d{2}'))
-                if date_el: date_str = str(date_el).strip()
-
-                comments.append({
-                    'writer': {'display_name': writer_name},
-                    'content': content,
-                    'created_at': date_str, 
-                    'is_html_parsed': True 
-                })
-            except: pass
-        return comments
-
-    @property
-    def name(self):
-        if self._article_data and self._article_data.get('title'):
-             title = self._article_data.get('title')
-             bbs_id = get_bbs_id(self.url)[1].split('?')[0]
-             return clean_title(f"{title} {bbs_id}")
-        bbs_id = get_bbs_id(self.url)[1].split('?')[0]
-        return clean_title(f"{bbs_id}")
 
     def init(self):
         self.session = Session()
         self.session.headers['User-Agent'] = downloader.hdr['User-Agent']
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+            'Referer': 'https://kone.gg/',
+            'Origin': 'https://kone.gg',
+            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+        })
+
+    @property
+    def id(self):
+        pid = get_post_id(self.url)
+        return f'kone_{pid}' if pid else 'kone_unknown'
 
     def read(self):
-        self.title = tr_('읽는 중... {}').format(self.name)
-        imgs = get_imgs(self) 
-        self.urls += imgs
-        self.title = self.name
-        
-        info_data = self._article_data.copy() if self._article_data else {}
-        if 'title' not in info_data: info_data['title'] = self.name
-        info_data['referer'] = self.url
-        info_data['comments_list'] = self._comments_data 
-        info_data['date'] = 10
-        info_data['p'] = 10
-
-        self.urls += [HTML(info_data, self.soup, imgs)]
-
-def get_imgs(self):
-    target_soup = None
-    # Use specific content if available to exclude profile images
-    if hasattr(self, '_article_data') and self._article_data and self._article_data.get('content'):
-        target_soup = Soup(self._article_data['content'])
-    else:
-        target_soup = self.soup 
-
-    url = self.url
-    session = self.session
-    imgs = []
-    url_imgs = []
-    url_imgs_set = set()
-    
-    for img in target_soup.findAll(['img', 'video']):
-        url_img = img.get('src') or img.get('data-originalurl')
-        if not url_img: continue
-        
-        # Fallback filtering
-        classes = img.get('class', [])
-        if classes and ('rounded-full' in str(classes)): continue
+        token = None
             
-        url_img = urljoin(url, url_img)
-        if url_img in url_imgs_set: continue
-        
-        url_imgs.append(url_img)
-        url_imgs_set.add(url_img)
-    
-    original_url_imgs = []
-    try:
-        bbs_id = re.sub(r'\?.*$', '', get_bbs_id(url)[1])
-        api_url = "https://api.kone.gg/v0/article/"+bbs_id+"/media/original"
-        api_data = {'media_url': url_imgs}
-        api_headers = { 
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36', 
-            'Content-Type': 'application/json', 
-            'Referer': 'https://kone.gg/' 
-        }
-        response = session.post(api_url, json=api_data, headers=api_headers, timeout=10)
-        response.raise_for_status()
-        media_data = response.json()
-        original_url_imgs = [media.get('url') for media in media_data.get('media', []) if media.get('url')]
-    except: pass
+        # Check data stability
+        js_check = """document.querySelector('#post_content').shadowRoot.querySelector('div[data-post-id]').getAttribute('data-post-id');"""
 
-    if len(url_imgs) != len(original_url_imgs):
-        original_url_imgs = url_imgs
+        def f(html, browser=None):
+            browser.show()
+            def check_cb(r): nonlocal token; token = r
+            browser.runJavaScript(js_check, callback=check_cb)
+            
+            if token:
+                browser.hide()
+            return True
+
+        res = clf2.solve(self.url, f=f, session=self.session)
+        raw_html = res['html']
+
+        self.data_post_id = token
+
+        print_ = get_print(self.cw)
+        print_(f'token: {token}')
+
+
+        # 데이터 조립
+        full_stream_data = ""
+        scripts = re.findall(r'<script[^>]*>(.*?)</script>', raw_html, re.DOTALL)
+        for script_content in scripts:
+            if 'self.__next_f.push' in script_content:
+                try:
+                    start_idx = script_content.find('self.__next_f.push(') + len('self.__next_f.push(')
+                    end_idx = script_content.rfind(')')
+                    
+                    if start_idx > len('self.__next_f.push(') - 1 and end_idx > start_idx:
+                        json_str = script_content[start_idx:end_idx]
+                        chunk = json.loads(json_str)
+                        
+                        if isinstance(chunk, list) and len(chunk) >= 2 and isinstance(chunk[1], str):
+                            full_stream_data += chunk[1]
+                except: pass
+
+        # 데이터 추출
+        post_id = get_post_id(self.url)
+        if not post_id: raise Exception("게시글 ID를 찾을 수 없습니다.")
+
+        info = {'title': 'Untitled', 'content': '', 'writer': 'Unknown', 'date': datetime.datetime.now().strftime('%Y-%m-%d')}
+        found_data = False
+
+        # PackedArticle
+        if not found_data:
+            try:
+                key_idx = full_stream_data.find('"PackedArticle":')
+                if key_idx != -1:
+                    val_start = full_stream_data.find('"', key_idx + len('"PackedArticle":'))
+                    if val_start != -1:
+                        decoder = json.JSONDecoder()
+                        packed_str, _ = decoder.raw_decode(full_stream_data, val_start)
+
+                        article_data = json.loads(packed_str)
+                        
+                        art_id = article_data.get('id', {})
+                        art_id_val = art_id.get('v') if isinstance(art_id, dict) else art_id
+                        
+                        if art_id_val == post_id:
+                            info['title'] = article_data.get('title', 'Untitled')
+                            info['content'] = article_data.get('content', '')
+                            w_obj = article_data.get('writer', {})
+                            info['writer'] = w_obj.get('display_name', 'Unknown')
+                            created = article_data.get('created_at', {})
+                            c_val = created.get('v') if isinstance(created, dict) else created
+                            if c_val: info['date'] = c_val[:10]
+                            found_data = True
+            except: pass
+
+        # 스트림 스캔
+        if not found_data:
+            t_match = re.search(r'"v":"' + re.escape(post_id) + r'".*?"title":"(.*?)"', full_stream_data)
+            if t_match:
+                try: info['title'] = json.loads(f'"{t_match.group(1)}"')
+                except: info['title'] = t_match.group(1)
+            
+            c_match = re.search(r'"v":"' + re.escape(post_id) + r'".*?"content":"(.*?)(?<!\\)"', full_stream_data)
+            if c_match:
+                try: info['content'] = json.loads(f'"{c_match.group(1)}"')
+                except: pass
+            
+            w_match = re.search(r'"v":"' + re.escape(post_id) + r'".*?"display_name":"(.*?)"', full_stream_data)
+            if w_match:
+                try: info['writer'] = json.loads(f'"{w_match.group(1)}"')
+                except: pass
+            
+            d_match = re.search(r'"created_at":"(.*?)"', full_stream_data)
+            if d_match: info['date'] = d_match.group(1)[:10]
+
+        # 제목
+        if info['title'] == 'Untitled':
+            soup = Soup(raw_html)
+            if soup.title: info['title'] = soup.title.string.split('|')[0].strip()
+        self.title = clean_title(info['title'])
+
+        # 카테고리 + 제목
+        try:
+            soup = Soup(raw_html)
+            h1 = soup.find('h1', class_='flex')
+            if h1:
+                title_text = h1.get_text(strip=True)
+                badge = h1.find_previous_sibling('span', attrs={'data-slot': 'badge'})
+                
+                if badge:
+                    cat_name = badge.get_text(strip=True)
+                    self.title = clean_title(f'[{cat_name}] {title_text}')
+        except: pass
+
+        # 댓글 추출
+        comments = []
+        try:
+            comments_match = re.search(r'"Comments":(\[.*?\])', full_stream_data)
+            if comments_match:
+                json_comments = json.loads(comments_match.group(1))
+                for c in json_comments:
+                    w = c.get('writer', {}).get('display_name', 'Unknown')
+                    t = c.get('content', '')
+                    d = c.get('created_at', '')[:10]
+                    pid = c.get('parent_id')
+                    comments.append({'writer': w, 'content': t, 'date': d, 'parent_id': pid})
+        except: pass
+
+        if not comments:
+            soup = Soup(raw_html)
+            for item in soup.find_all('div', class_='group/comment'):
+                try:
+                    w_tag = item.find('a', href=re.compile(r'^/u/'))
+                    w = w_tag.get_text(strip=True) if w_tag else "Unknown"
+                    if w_tag and w_tag.find('img') and w_tag.find('img').get('alt'):
+                        w = w_tag.find('img').get('alt')
+                    c_tag = item.find('div', class_='whitespace-pre-wrap')
+                    c = c_tag.get_text('\n', strip=True) if c_tag else ""
+                    d_tag = item.find('div', class_='text-zinc-500')
+                    d = d_tag.get_text(strip=True) if d_tag else ""
+                    parent = item.find_parent('div', class_='relative')
+                    is_reply = parent and ('ml-' in str(parent.get('class', [])))
+                    comments.append({'writer': w, 'content': c, 'date': d, 'parent_id': is_reply})
+                except: pass
+
+        # HTML에서 이미지(열화판) 추출
+        image_list = []
+        seen = set()
         
-    for i, (url_img, originla_url_img) in enumerate(zip(url_imgs, original_url_imgs)):
-        ext = get_ext(originla_url_img) or ".webp"
-        name = f'{i:04}{ext}'
-        img = File_kone({'referer':url_img, 'url':originla_url_img, 'name':name})
-        imgs.append(img)
-    return imgs
+        content_soup = Soup(info['content'])
+        for img in content_soup.find_all('img'):
+            src = img.get('src') or img.get('data-originalurl')
+            if not src:
+                continue
+        
+            full_url = urljoin(self.url, src).replace(r'\/', '/')
+        
+            if full_url in seen:
+                continue
+
+            seen.add(full_url)
+            image_list.append(full_url)
+
+        # 원본 이미지 URL 가져오기 시도
+        original_url_imgs = []
+        data_post_id = self.data_post_id
+        print_ = get_print(self.cw)
+        api_url = ""
+
+        if data_post_id and image_list:
+            try:
+                api_url = f"https://api.kone.gg/v0/article/{data_post_id}/media/original"
+                api_data = {'media_url': image_list}
+                api_headers = self.session.headers.copy()
+                api_headers['Content-Type'] = 'application/json'
+
+                response = self.session.post(api_url, json=api_data, headers=api_headers, timeout=10)
+                response.raise_for_status()
+                media_data = response.json()
+                
+                original_url_imgs = [media.get('url') for media in media_data.get('media', []) if media.get('url')]
+                print_(f'[Kone] 원본 이미지 추출 성공: {len(original_url_imgs)}개')
+            except Exception as e:
+                print_(f'[Kone] 원본 API 호출 실패: {e}')
+                original_url_imgs = []
+        else:
+            if not data_post_id:
+                print_('[Kone] data_post_id가 없으므로 열화판으로 진행합니다.')
+
+        # URL 리스트 확정 및 파일 객체 생성
+        self.urls = []
+        url_to_filename = {}
+
+        # ID가 있고, 개수가 일치할 때만 원본 모드 활성화
+        use_original = data_post_id and (len(image_list) == len(original_url_imgs))
+
+        for i, raw_url in enumerate(image_list):
+            target_url = original_url_imgs[i] if use_original else raw_url
+            
+            clean_url = target_url
+            ext = get_ext(clean_url) or '.webp'
+            filename = f'{i+1:04}{ext}'
+            
+            file_obj = File_kone({
+                'url': clean_url, 
+                'name': filename, 
+                'referer': api_url if use_original else self.url
+            }, fallback_url=raw_url if use_original else None)
+
+            self.urls.append(file_obj)
+            
+            url_to_filename[raw_url] = filename
+            url_to_filename[clean_url] = filename
+            url_to_filename[raw_url.replace('&', '&amp;')] = filename
+
+            if 'mittere.io' in clean_url:
+                try:
+                    file_hash = clean_url.split('/')[-1]
+                    url_to_filename[file_hash] = filename
+                except: pass
+
+        # HTML 생성
+        html_data = {
+            'title': info['title'],
+            'content': info['content'],
+            'writer': info['writer'],
+            'date': info['date'],
+            'url': self.url,
+            'comments': comments,
+            'url_map': url_to_filename
+        }
+        self.urls.append(HTML(html_data))
+
 
 class File_kone(File):
+    def __init__(self, info, fallback_url=None):
+        super().__init__(info)
+        self.fallback_url = fallback_url
+        self.referer_url = info.get('referer')
+
     def alter(self):
-        return self['referer']
-    
+        if self.fallback_url: return self.fallback_url
+        return self.referer_url
+
 class HTML(File):
     type = 'kone'
     format = 'title'
 
-    def __init__(self, info, soup, imgs_files):
-        original_title = info.get('title', 'No Title')
-        safe_title = clean_title(original_title)
-        d = {'title': safe_title}
-        info['name'] = utils.format(self.type, d, '.html')
-        super().__init__(info)
-        
-        self.original_title_text = original_title
-        self.soup = soup
-        self.referer_url = info.get('referer', '')
-        self.imgs_files = imgs_files 
-        self.comments = info.get('comments_list', [])
+    def __init__(self, info):
+        title = clean_title(info.get('title', 'No Title'))
+        super().__init__({'name': f"{title}.html"})
+        self.info_data = info 
 
-    def get(self, *args):
-        # Lookup mode
-        if args:
-            key = args[0]
-            default = args[1] if len(args) > 1 else None
-            try: return self[key]
-            except: return default
-        
-        # HTML Generation mode
-        def safe_get(k, d=''):
-            try: return self[k]
-            except: return d
+    def get(self):
+        return self.make_html()
 
-        title = self.original_title_text
-        writer_data = safe_get('writer', {})
-        if not isinstance(writer_data, dict): writer_data = {}
-        
-        writer_name = writer_data.get('display_name', 'Unknown')
-        writer_handle = writer_data.get('handle', '')
-        views = safe_get('views', 0)
-        votes = safe_get('votes', 0)
-        
-        raw_date = safe_get('created_at', '')
-        date_str = raw_date
+    def make_html(self):
+        data = self.info_data
+        url_map = data.get('url_map', {})
+        content = data['content']
+
+        # 문자열 치환
+        for original, filename in url_map.items():
+            if len(original) > 10:
+                content = content.replace(original, filename)
+            
+            # 해시값 치환
+            if len(original) > 20 and '/' not in original:
+                pattern = re.compile(r'src="[^"]*?' + re.escape(original) + r'[^"]*"')
+                content = pattern.sub(f'src="{filename}"', content)
+
+        # DOM 정리
         try:
-            if raw_date:
-                dt = datetime.datetime.fromisoformat(raw_date.replace('Z', '+00:00'))
-                date_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+            soup = Soup(content)
+            for img in soup.find_all('img'):
+                src = img.get('src', '')
+                if not src.startswith('http'):
+                    for attr in ['srcset', 'loading', 'style', 'width', 'height', 'class', 'data-originalurl']:
+                        if img.has_attr(attr): del img[attr]
+                    img['style'] = "max-width: 100%; height: auto; display: block; margin: 20px auto; border-radius: 8px;"
+            
+            for tag in soup.find_all(['video', 'script', 'iframe', 'style']):
+                tag.decompose()
+            for a in soup.find_all('a'): a['target'] = '_blank'
+            
+            content = str(soup)
         except: pass
 
-        sub_id = safe_get('sub_id', 'somisoft')
-
-        def render_comments(comments):
-            if not comments: return '<div class="p-4 text-sm text-zinc-500">댓글이 없습니다.</div>'
-            
-            html_parts = []
-            html_parts.append(f'<div class="p-4 md:px-6"><h2 class="text-lg font-medium mb-3">댓글 {len(comments)}개</h2>')
-            
-            for c in comments:
-                c_writer = c.get('writer', {})
-                c_name = c_writer.get('display_name', 'Unknown')
-                c_content = c.get('content', '')
+        # 댓글 HTML
+        comments_html = ""
+        if data['comments']:
+            for c in data['comments']:
+                initial = c['writer'][0] if c['writer'] else "?"
+                indent_style = "margin-left: 2rem; border-left: 2px solid #3f3f46; padding-left: 0.5rem;" if c.get('parent_id') else ""
                 
-                c_date = c.get('created_at', '')
-                if not c.get('is_html_parsed'):
-                    try:
-                        if c_date:
-                            dt = datetime.datetime.fromisoformat(c_date.replace('Z', '+00:00'))
-                            c_date = dt.strftime('%m.%d %H:%M')
-                    except: pass
-                
-                indent_class = "reply-indent" if c.get('parent_id') else ""
-                initial = c_name[0] if c_name else '?'
-
-                html_parts.append(f"""
-                <div class="comment-item {indent_class}">
-                    <div class="flex items-start gap-2">
-                        <div class="comment-avatar-box">
-                            {initial}
+                comments_html += f"""
+                <div class="comment-item" style="{indent_style}">
+                    <div class="comment-avatar">{initial}</div>
+                    <div class="comment-body">
+                        <div class="comment-meta">
+                            <span class="comment-author">{c['writer']}</span>
+                            <span class="comment-date">{c['date']}</span>
                         </div>
-                        <div class="flex-1">
-                            <div class="flex items-end gap-2 mb-1">
-                                <span class="text-sm font-medium">{c_name}</span>
-                                <span class="text-xs text-zinc-500">{c_date}</span>
-                            </div>
-                            <div class="comment-content">
-                                {c_content}
-                            </div>
-                        </div>
+                        <div class="comment-text">{c['content']}</div>
                     </div>
                 </div>
-                """)
-            
-            html_parts.append('</div>')
-            return "".join(html_parts)
+                """
+        else:
+            comments_html = "<div style='color:#777; text-align:center; padding:20px;'>댓글이 없습니다.</div>"
 
-        comments_html = render_comments(self.comments)
-
-        html_template = f"""
-        <html lang="ko" class="light">
+        # HTML
+        html = f"""
+        <!DOCTYPE html>
+        <html lang="ko">
         <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>{title}</title>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>{data['title']}</title>
+            <style>{KONE_CLEAN_CSS}</style>
         </head>
-        <body class="bg-[#fcfcfc] dark:bg-zinc-900">
-            <div class="container mx-auto">
-                <style>{KONE_CSS}</style>
+        <body>
+            <div class="layout">
+                <header>
+                    <span class="badge">Kone</span>
+                    <h1>{data['title']}</h1>
+                    <div class="meta">
+                        <div class="avatar">{data['writer'][0] if data['writer'] else '?'}</div>
+                        <span>{data['writer']}</span>
+                        <span>•</span>
+                        <span>{data['date']}</span>
+                        <span>•</span>
+                        <a href="{data['url']}" target="_blank">원본 링크</a>
+                    </div>
+                </header>
                 
-                <div class="contents">
-                    <div class="pb-4 pt-2 pl-6 pr-3">
-                        <div class="mb-3 flex justify-between items-center gap-2">
-                            <div class="flex flex-col md:flex-row gap-1 md:gap-2 md:items-center">
-                                <span class="badge">
-                                    <div class="mt-[1px]">{sub_id}</div>
-                                </span>
-                                <h1 class="flex items-center gap-1.5 py-2 text-2xl font-bold">
-                                    {title}
-                                </h1>
-                            </div>
-                        </div>
-                        <div class="flex items-end justify-between">
-                            <div class="flex items-center gap-3">
-                                <div class="rounded-full bg-zinc-700 h-10 w-10 flex items-center justify-center text-zinc-50 font-bold">
-                                    {writer_name[0] if writer_name else 'U'}
-                                </div>
-                                <div class="flex flex-col gap-1">
-                                    <div class="flex items-center gap-1 text-sm font-medium">
-                                        <span>{writer_name}</span> 
-                                        <span class="text-xs text-zinc-400">(@{writer_handle})</span>
-                                    </div>
-                                    <div class="text-xs text-zinc-400">{date_str}</div>
-                                </div>
-                            </div>
-                            <div class="text-xs text-zinc-400">
-                                조회 {views} · 좋아요 {votes}
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <hr style="border-color: #eee; margin: 10px 0;">
+                <div class="prose">
+                    {content}
+                </div>
 
-                    <div class="relative min-h-60">
-                        <div class="p-4 md:p-6">
-                            <div id="post_content" class="prose-container content">
-                            </div>
-                        </div>
+                <div class="comments-section">
+                    <div class="comments-header">
+                        댓글 {len(data['comments'])}
                     </div>
-
-                    <hr style="border-color: #eee; margin: 10px 0;">
-
-                    <div class="comment-section">
-                        {comments_html}
-                    </div>
+                    {comments_html}
                 </div>
             </div>
         </body>
         </html>
         """
         
-        doc = BeautifulSoup(html_template, 'html.parser')
-        content_container = doc.find(id='post_content')
-        
-        content_clone = BeautifulSoup(str(self.soup), 'html.parser')
-        if content_clone:
-            target = content_clone.body.contents if content_clone.body else content_clone.contents
-            for element in list(target):
-                content_container.append(element)
-
-        url_map = {}
-        for file_obj in self.imgs_files:
-            url_map[file_obj['referer']] = file_obj['name']
-
-        for tag in content_container.find_all(['img', 'video']):
-            original_src = tag.get('src') or tag.get('data-originalurl')
-            if not original_src: continue
-            
-            abs_src = urljoin(self.referer_url, original_src)
-            
-            if abs_src in url_map:
-                tag['src'] = url_map[abs_src]
-                for attr in ['srcset', 'loading', 'data-originalurl', 'style', 'sizes', 'class']:
-                    if tag.has_attr(attr): del tag[attr]
-
         f = BytesIO()
-        f.write(str(doc).encode('utf-8'))
+        f.write(html.encode('utf-8'))
         f.seek(0)
         return {'url': f}
 
-messageBox('{}: kone'.format(tr_('사이트를 추가했습니다')))
+messageBox('{}: kone (Debug Ver)'.format(tr_('사이트를 추가했습니다')))
