@@ -1,427 +1,813 @@
 #coding: utf8
-#title: kone.gg
-#comment: https://kone.gg
+#title: Kone.gg
+#comment: Kone.gg article downloader
 
-import downloader
-from utils import urljoin, Downloader, Soup, clean_title, get_ext, File, Session, get_print
-from translator import tr_
-import errors
-import clf2
-from io import BytesIO
+from __future__ import print_function
+
+import base64
+import mimetypes
 import re
-import json
-import datetime
-import traceback
+import uuid
+from io import BytesIO
+
+import clf2
+import downloader
+import errors
+from translator import tr_
+from utils import Downloader, File, Session, Soup, clean_title, get_ext, urljoin
+
+try:
+    from bs4 import Comment
+except Exception:
+    Comment = None
+
+try:
+    from html import escape, unescape
+except ImportError:
+    from cgi import escape
+
+    def unescape(s):
+        return s
+
+try:
+    from urllib.parse import urlparse
+except ImportError:
+    from urlparse import urlparse
+
 
 class LoginRequired(errors.LoginRequired):
-    def __init__(self, *args):
-        super().__init__(*args, method='browser', url='https://kone.gg/account/signin?path=%2F')
+    def __init__(self, *args, **kwargs):
+        super(LoginRequired, self).__init__(
+            method='browser',
+            url='https://kone.gg/account/signin?path=%2F',
+        )
 
-def get_post_id(url):
-    if '/s/' in url:
+
+KONE_ROOT = 'https://kone.gg'
+KONE_API_ROOT = 'https://api.kone.gg'
+
+ACCEPT_COOKIES = [r'(.*\.)?kone\.gg']
+URLS = [
+    r'regex:https?://(?:www\.)?kone\.gg/s/[^/?#]+/[^/?#]+',
+]
+
+MEDIA_TAGS = ('img', 'video', 'audio', 'source')
+DROP_TAGS = ('script', 'style', 'button', 'svg', 'input', 'textarea', 'select', 'form')
+
+CONTENT_TYPE_EXTS = {
+    'image/jpeg': '.jpg',
+    'image/jpg': '.jpg',
+    'image/png': '.png',
+    'image/gif': '.gif',
+    'image/webp': '.webp',
+    'image/bmp': '.bmp',
+    'image/avif': '.avif',
+    'video/mp4': '.mp4',
+    'video/webm': '.webm',
+    'video/ogg': '.ogv',
+    'audio/mpeg': '.mp3',
+    'audio/mp4': '.m4a',
+    'audio/ogg': '.ogg',
+    'audio/wav': '.wav',
+}
+
+
+def _normalize_space(text):
+    if text is None:
+        return ''
+    return re.sub(r'\s+', ' ', unescape(text)).strip()
+
+
+def _text(tag):
+    if not tag:
+        return ''
+    return _normalize_space(tag.get_text(' ', strip=True))
+
+
+def _abs_url(base, value):
+    if not value:
+        return ''
+    value = unescape(value).strip()
+    if not value or value.startswith('data:') or value.startswith('blob:'):
+        return value
+    if value.startswith('//'):
+        return 'https:' + value
+    return urljoin(base, value)
+
+
+def _is_downloadable(url):
+    return bool(url) and not url.startswith('data:') and not url.startswith('blob:')
+
+
+def _path_ext(url):
+    try:
+        path = urlparse(url).path
+    except Exception:
+        path = url.split('?', 1)[0]
+    ext = get_ext(path)
+    if ext:
+        return ext.lower()
+    return ''
+
+
+def _guess_ext(url, tag_name='', content_type=''):
+    ext = _path_ext(url)
+    if ext:
+        return ext
+
+    ctype = (content_type or '').split(';', 1)[0].strip().lower()
+    if ctype in CONTENT_TYPE_EXTS:
+        return CONTENT_TYPE_EXTS[ctype]
+
+    guessed = mimetypes.guess_extension(ctype) if ctype else None
+    if guessed:
+        return guessed
+
+    if tag_name == 'video':
+        return '.mp4'
+    if tag_name == 'audio':
+        return '.mp3'
+    return '.webp'
+
+
+def _split_post_url(url):
+    parsed = urlparse(url)
+    parts = [p for p in parsed.path.split('/') if p]
+    if len(parts) < 3 or parts[0] != 's':
+        raise ValueError('Not a Kone article URL')
+    return parts[1], parts[2]
+
+
+def _fix_mojibake(html):
+    if not isinstance(html, str):
         try:
-            parts = url.split('/')
-            return parts[5].split('?')[0]
-        except: pass
+            html = html.decode('utf-8', 'replace')
+        except Exception:
+            html = str(html)
+
+    sample = html[:100000]
+    if re.search(r'[가-힣]', sample):
+        return html
+
+    try:
+        fixed = html.encode('latin-1').decode('utf-8')
+    except Exception:
+        return html
+
+    if re.search(r'[가-힣]', fixed[:100000]):
+        return fixed
+    return html
+
+
+def _remove_comments(node):
+    if Comment is None:
+        return
+    for comment in list(node.find_all(string=lambda x: isinstance(x, Comment))):
+        comment.extract()
+
+
+def _class_list(value):
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        values = value
+    else:
+        values = str(value).split()
+    return [str(v) for v in values]
+
+
+def _has_class(tag, class_name):
+    return class_name in _class_list(tag.get('class'))
+
+
+def _has_classes(tag, class_names):
+    classes = _class_list(tag.get('class'))
+    return all(class_name in classes for class_name in class_names)
+
+
+def _find_class(root, class_name, name=True):
+    if not root:
+        return None
+    for tag in root.find_all(name):
+        if _has_class(tag, class_name):
+            return tag
     return None
 
-# [CSS]
-KONE_CLEAN_CSS = """
-    :root { --bg-primary: #18181b; --bg-secondary: #27272a; --text-primary: #e4e4e7; --text-secondary: #a1a1aa; --accent: #3b82f6; --border: #3f3f46; }
-    body { margin: 0; padding: 0; background-color: var(--bg-primary); color: var(--text-primary); font-family: Pretendard, -apple-system, BlinkMacSystemFont, system-ui, Roboto, sans-serif; line-height: 1.6; }
-    .layout { max-width: 900px; margin: 0 auto; padding: 40px 20px; min-height: 100vh; }
-    header { border-bottom: 1px solid var(--border); padding-bottom: 20px; margin-bottom: 30px; }
-    .badge { display: inline-block; background: var(--bg-secondary); color: var(--text-secondary); padding: 2px 8px; border-radius: 9999px; font-size: 12px; font-weight: 600; margin-bottom: 10px; border: 1px solid var(--border); }
-    h1 { margin: 0 0 10px 0; font-size: 24px; font-weight: 700; line-height: 1.4; color: #fff; }
-    .meta { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text-secondary); }
-    .avatar { width: 24px; height: 24px; border-radius: 50%; background: var(--bg-secondary); display: flex; align-items: center; justify-content: center; font-weight: bold; overflow: hidden; color: #fff; font-size: 12px; }
-    .prose { font-size: 16px; margin-bottom: 40px; word-break: break-all; }
-    .prose img { max-width: 100%; height: auto; display: block; margin: 20px auto; border-radius: 8px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3); }
-    .comments-section { margin-top: 50px; border-top: 1px solid var(--border); padding-top: 30px; }
-    .comments-header { font-size: 18px; font-weight: 600; margin-bottom: 20px; color: #fff; }
-    .comment-item { display: flex; gap: 12px; margin-bottom: 15px; padding: 12px; background-color: var(--bg-secondary); border-radius: 8px; }
-    .comment-avatar { width: 32px; height: 32px; border-radius: 50%; background: #52525b; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 12px; color: #fff; overflow: hidden; }
-    .comment-avatar img { width: 100%; height: 100%; object-fit: cover; }
-    .comment-body { flex: 1; min-width: 0; }
-    .comment-meta { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
-    .comment-author { font-size: 14px; font-weight: 600; color: #fff; }
-    .comment-date { font-size: 12px; color: var(--text-secondary); }
-    .comment-text { font-size: 14px; color: var(--text-primary); white-space: pre-wrap; word-break: break-word; }
-"""
+
+def _find_classes(root, class_names, name=True):
+    if not root:
+        return None
+    for tag in root.find_all(name):
+        if _has_classes(tag, class_names):
+            return tag
+    return None
+
+
+def _find_all_class(root, class_name, name=True):
+    if not root:
+        return []
+    return [tag for tag in root.find_all(name) if _has_class(tag, class_name)]
+
+
+def _clean_dom(node, base_url):
+    _remove_comments(node)
+
+    for tag in list(node.find_all(DROP_TAGS)):
+        tag.decompose()
+
+    for tag in list(node.find_all(True)):
+        name = tag.name.lower()
+
+        for attr in list(tag.attrs):
+            attr_l = attr.lower()
+            if attr_l.startswith('on'):
+                del tag.attrs[attr]
+                continue
+            if attr_l in ('srcset', 'sizes', 'loading', 'decoding', 'data-state', 'data-slot'):
+                del tag.attrs[attr]
+
+        if name == 'a':
+            href = _abs_url(base_url, tag.get('href', ''))
+            if href.startswith('javascript:'):
+                del tag.attrs['href']
+            elif href:
+                tag['href'] = href
+                tag['target'] = '_blank'
+                tag['rel'] = 'noopener noreferrer'
+
+        if name in ('img', 'video', 'audio', 'source'):
+            if tag.get('src'):
+                tag['src'] = _abs_url(base_url, tag.get('src'))
+            if tag.get('poster'):
+                tag['poster'] = _abs_url(base_url, tag.get('poster'))
+            if name in ('video', 'audio'):
+                tag['controls'] = ''
+
+        if name == 'iframe' and tag.get('src'):
+            tag['src'] = _abs_url(base_url, tag.get('src'))
+
+    for tag in list(node.find_all(['div', 'span'])):
+        if tag.name is None:
+            continue
+        has_media = tag.find(['img', 'video', 'audio', 'iframe', 'br'])
+        if not has_media and not tag.get_text(strip=True) and not tag.get('id'):
+            tag.decompose()
+
+    return node
+
+
+def _fragment_html(tag, base_url, selector=None, inner=True):
+    if not tag:
+        return ''
+    soup = Soup(str(tag))
+    root = soup
+    if selector:
+        if selector.startswith('.'):
+            root = _find_class(soup, selector[1:]) or soup
+        elif selector.startswith('#'):
+            root = soup.find(id=selector[1:]) or soup
+        else:
+            root = soup.find(selector) or soup
+    _clean_dom(root, base_url)
+    if inner and hasattr(root, 'contents'):
+        return ''.join(str(child) for child in root.contents)
+    return str(root)
+
+
+def _add_media(media, seen, base_url, tag, attr, kind=None):
+    url = _abs_url(base_url, tag.get(attr))
+    if not _is_downloadable(url):
+        return
+    if url in seen:
+        return
+
+    tag_name = kind or tag.name.lower()
+    ext = _guess_ext(url, tag_name)
+    filename = '{:04d}{}'.format(len(media) + 1, ext)
+
+    seen.add(url)
+    media.append({
+        'url': url,
+        'name': filename,
+        'tag': tag_name,
+    })
+
+
+def _extract_media(node, base_url, media, seen):
+    if not node:
+        return
+    for tag in node.find_all(MEDIA_TAGS):
+        name = tag.name.lower()
+        if tag.get('src'):
+            _add_media(media, seen, base_url, tag, 'src', name)
+        if name in ('video', 'audio') and tag.get('poster'):
+            _add_media(media, seen, base_url, tag, 'poster', 'img')
+
+
+def _replace_media_urls(html, media):
+    if not html:
+        return html
+
+    for item in sorted(media or [], key=lambda x: len(x.get('url') or ''), reverse=True):
+        url = item.get('url') or ''
+        name = item.get('name') or ''
+        if not url or not name:
+            continue
+
+        html = html.replace(url, name)
+        html = html.replace(url.replace('&', '&amp;'), name)
+        html = html.replace(escape(url, quote=True), name)
+
+    return html
+
+
+def _apply_local_media_paths(parsed):
+    media = parsed.get('media') or []
+    if not parsed.get('mhtml_base'):
+        post_id = re.sub(r'[^A-Za-z0-9._-]+', '_', parsed.get('post_id') or 'post')
+        parsed['mhtml_base'] = 'https://kone-archive.local/{}/'.format(post_id)
+
+    parsed['content_html'] = _replace_media_urls(parsed.get('content_html') or '', media)
+
+    for comment in parsed.get('comments') or []:
+        comment['html'] = _replace_media_urls(comment.get('html') or '', media)
+
+    return parsed
+
+
+def _first_text_matching(root, pattern):
+    if not root:
+        return ''
+    regex = re.compile(pattern)
+    for s in root.find_all(string=regex):
+        text = _normalize_space(s)
+        if text:
+            return text
+    return ''
+
+
+def _find_user_link(root):
+    if not root:
+        return None
+    first = None
+    for link in root.find_all('a', href=True):
+        href = link.get('href') or ''
+        if not (href.startswith('/u/') or href.startswith('https://kone.gg/u/')):
+            continue
+        if first is None:
+            first = link
+        if link.find('span') or _text(link):
+            return link
+    return first
+
+
+def _parse_comments(soup, base_url, media, seen):
+    root = soup.find(id='post-comment')
+    if not root:
+        return []
+
+    comments = []
+    for item in _find_all_class(root, 'comment-item'):
+        content = _find_class(item, 'whitespace-pre-wrap')
+        if not content:
+            continue
+
+        _extract_media(content, base_url, media, seen)
+
+        user = ''
+        user_url = ''
+        user_link = _find_user_link(item)
+        if user_link:
+            user_url = _abs_url(base_url, user_link.get('href'))
+            user_span = user_link.find('span')
+            user = _text(user_span) or _text(user_link)
+
+        time_text = ''
+        meta = _find_classes(item, ('text-xs', 'text-muted-foreground'))
+        if meta:
+            time_text = _text(meta)
+
+        depth = 0
+        try:
+            depth = max(0, len(item.find_parents(class_='comment-list')) - 1)
+        except Exception:
+            depth = 0
+
+        comments.append({
+            'user': user,
+            'user_url': user_url,
+            'time': time_text,
+            'depth': min(depth, 4),
+            'html': _fragment_html(content, base_url, inner=True),
+            'text': _text(content),
+        })
+
+    return comments
+
+
+def _find_title(article, soup):
+    h1 = article.find('h1') if article else None
+    title = _text(h1)
+    if title:
+        return title
+
+    og_title = soup.find('meta', {'property': 'og:title'})
+    if og_title and og_title.get('content'):
+        return _normalize_space(og_title.get('content'))
+
+    doc_title = soup.find('title')
+    return _text(doc_title) or 'kone'
+
+
+def _find_category(article, base_url):
+    if not article:
+        return ''
+    for a in article.find_all('a', href=True):
+        href = _abs_url(base_url, a.get('href'))
+        text = _text(a)
+        if 'category=' in href and text:
+            return text.strip('[] ')
+    return ''
+
+
+def _find_writer(article):
+    if not article:
+        return ''
+    link = _find_user_link(article)
+    if not link:
+        return ''
+    span = link.find('span')
+    return _text(span) or _text(link)
+
+
+def _find_stats(article):
+    text = _text(article)
+    stats = []
+    for pattern in (r'조회\s*[0-9,]+', r'좋아요\s*-?[0-9,]+', r'댓글\s*[0-9,]+\s*개'):
+        m = re.search(pattern, text)
+        if m:
+            stats.append(m.group(0))
+    return ' / '.join(stats)
+
+
+def _parse_article(html, url):
+    soup = Soup(html)
+    article = soup.find(id='post-article')
+    if not article:
+        raise LoginRequired()
+
+    content = _find_class(article, 'ProseMirror')
+    if not content:
+        raise Exception('Kone article body was not found')
+
+    media = []
+    seen = set()
+    _extract_media(content, url, media, seen)
+
+    comments = _parse_comments(soup, url, media, seen)
+
+    meta_time = soup.find('meta', {'property': 'article:published_time'})
+    published = meta_time.get('content') if meta_time and meta_time.get('content') else ''
+    visible_time = _first_text_matching(article, r'\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}')
+
+    sub_handle, post_id = _split_post_url(url)
+
+    parsed = {
+        'url': url,
+        'sub_handle': sub_handle,
+        'post_id': post_id,
+        'title': _find_title(article, soup),
+        'category': _find_category(article, url),
+        'writer': _find_writer(article),
+        'published': published,
+        'visible_time': visible_time,
+        'stats': _find_stats(article),
+        'content_html': _fragment_html(content, url, '.ProseMirror', inner=True),
+        'comments': comments,
+        'media': media,
+    }
+    return parsed
+
+
+class KoneMedia(File):
+    type = 'kone'
+
+    def __init__(self, info, referer):
+        self.referer = referer
+        File.__init__(self, info)
+
+    def alter(self):
+        return self.referer
+
+
+class KoneMHTML(File):
+    type = 'kone'
+
+    def __init__(self, parsed, session):
+        self.parsed = parsed
+        self.session = session
+        File.__init__(self, {
+            'name': '{}.mhtml'.format(clean_title(parsed['archive_name'])),
+        })
+
+    def _html(self):
+        p = self.parsed
+        title = escape(p.get('title') or 'kone')
+        url = escape(p.get('url') or '')
+        base_url = escape(p.get('mhtml_base') or '')
+        category = escape(p.get('category') or '')
+        writer = escape(p.get('writer') or '')
+        visible_time = escape(p.get('visible_time') or p.get('published') or '')
+        stats = escape(p.get('stats') or '')
+
+        comments_html = []
+        for comment in p.get('comments') or []:
+            margin = int(comment.get('depth') or 0) * 24
+            user = escape(comment.get('user') or 'anonymous')
+            user_url = escape(comment.get('user_url') or '')
+            time_text = escape(comment.get('time') or '')
+            body = comment.get('html') or ''
+            if user_url:
+                user_html = '<a href="{0}">{1}</a>'.format(user_url, user)
+            else:
+                user_html = user
+            comments_html.append(
+                '<article class="kone-comment" style="margin-left:{0}px">'
+                '<div class="kone-comment-meta"><strong>{1}</strong><span>{2}</span></div>'
+                '<div class="kone-comment-body">{3}</div>'
+                '</article>'.format(margin, user_html, time_text, body)
+            )
+
+        meta_bits = []
+        if category:
+            meta_bits.append(category)
+        if writer:
+            meta_bits.append(writer)
+        if visible_time:
+            meta_bits.append(visible_time)
+        if stats:
+            meta_bits.append(stats)
+
+        return '''<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<base href="{base_url}">
+<title>{title}</title>
+<style>
+:root {{
+  color-scheme: dark;
+  --bg: #0b0c10;
+  --panel: #14161c;
+  --panel-2: #1a1d24;
+  --line: #2a2f38;
+  --text: #e6e8ef;
+  --muted: #a4a9b6;
+  --link: #8ab4ff;
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.62;
+}}
+a {{ color: var(--link); text-decoration: none; }}
+a:hover {{ text-decoration: underline; }}
+.kone-wrap {{ max-width: 980px; margin: 0 auto; padding: 28px 18px 56px; }}
+.kone-head {{ border-bottom: 1px solid var(--line); padding-bottom: 18px; margin-bottom: 24px; }}
+.kone-title {{ margin: 0 0 10px; font-size: 28px; line-height: 1.32; }}
+.kone-meta, .kone-source {{ color: var(--muted); font-size: 13px; }}
+.kone-meta span + span::before {{ content: " / "; color: #6f7683; }}
+.kone-article {{
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 20px;
+  overflow-wrap: anywhere;
+}}
+.kone-article img, .kone-comment-body img {{
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 14px auto;
+  border-radius: 6px;
+}}
+.kone-article video, .kone-article audio,
+.kone-comment-body video, .kone-comment-body audio {{
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  margin: 14px 0;
+}}
+.kone-article p {{ margin: 0.85em 0; }}
+.kone-comments {{ margin-top: 28px; }}
+.kone-comments h2 {{ font-size: 18px; margin: 0 0 12px; }}
+.kone-comment {{
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-top: 8px;
+}}
+.kone-comment-meta {{
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 6px;
+}}
+.kone-comment-meta strong {{ color: var(--text); font-size: 13px; }}
+.kone-comment-body {{ white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; }}
+blockquote {{
+  margin: 1em 0;
+  padding-left: 1em;
+  border-left: 3px solid var(--line);
+  color: var(--muted);
+}}
+pre, code {{
+  background: #0f1117;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}}
+pre {{ padding: 12px; overflow-x: auto; }}
+code {{ padding: 1px 4px; }}
+table {{ max-width: 100%; border-collapse: collapse; }}
+td, th {{ border: 1px solid var(--line); padding: 6px 8px; }}
+</style>
+</head>
+<body>
+<main class="kone-wrap">
+  <header class="kone-head">
+    <h1 class="kone-title">{title}</h1>
+    <div class="kone-meta">{meta}</div>
+    <div class="kone-source"><a href="{url}">{url}</a></div>
+  </header>
+  <section class="kone-article">{content}</section>
+  <section class="kone-comments">
+    <h2>Comments ({comment_count})</h2>
+    {comments}
+  </section>
+</main>
+</body>
+</html>'''.format(
+            title=title,
+            url=url,
+            base_url=base_url,
+            meta=''.join('<span>{}</span>'.format(x) for x in meta_bits),
+            content=p.get('content_html') or '',
+            comment_count=len(p.get('comments') or []),
+            comments='\n'.join(comments_html),
+        )
+
+    def _fetch_media(self, url):
+        headers = {
+            'Referer': self.parsed.get('url') or KONE_ROOT,
+            'Accept': '*/*',
+        }
+        try:
+            res = self.session.get(url, headers=headers, timeout=60)
+        except TypeError:
+            res = self.session.get(url, timeout=60)
+
+        if hasattr(res, 'raise_for_status'):
+            res.raise_for_status()
+
+        data = getattr(res, 'content', None)
+        if data is None:
+            data = res
+        if isinstance(data, str):
+            data = data.encode('utf-8')
+
+        headers_obj = getattr(res, 'headers', {}) or {}
+        content_type = headers_obj.get('Content-Type') or headers_obj.get('content-type') or ''
+        content_type = content_type.split(';', 1)[0].strip()
+        if not content_type:
+            content_type = mimetypes.guess_type(urlparse(url).path)[0] or 'application/octet-stream'
+
+        return content_type, data
+
+    @staticmethod
+    def _b64(data):
+        encoded = base64.b64encode(data).decode('ascii')
+        return '\r\n'.join(encoded[i:i + 76] for i in range(0, len(encoded), 76))
+
+    def _part(self, content_type, location, data):
+        return (
+            'Content-Type: {0}\r\n'
+            'Content-Transfer-Encoding: base64\r\n'
+            'Content-Location: {1}\r\n\r\n'
+            '{2}\r\n'
+        ).format(content_type, location, self._b64(data))
+
+    def get(self):
+        boundary = '----=_Kone_{0}'.format(uuid.uuid4().hex)
+        html_data = self._html().encode('utf-8')
+        base_url = self.parsed.get('mhtml_base') or (KONE_ROOT + '/')
+
+        chunks = [
+            'From: <Saved by Hitomi Downloader>\r\n',
+            'Subject: {0}\r\n'.format(self.parsed.get('title') or 'kone'),
+            'MIME-Version: 1.0\r\n',
+            'Content-Type: multipart/related; type="text/html"; boundary="{0}"\r\n\r\n'.format(boundary),
+            '--{0}\r\n'.format(boundary),
+            self._part(
+                'text/html; charset="utf-8"',
+                base_url.rstrip('/') + '/index.html',
+                html_data,
+            ),
+        ]
+
+        for item in self.parsed.get('media') or []:
+            url = item.get('url')
+            if not _is_downloadable(url):
+                continue
+            try:
+                content_type, data = self._fetch_media(url)
+                chunks.append('--{0}\r\n'.format(boundary))
+                chunks.append(self._part(
+                    content_type,
+                    base_url.rstrip('/') + '/' + (item.get('name') or url),
+                    data,
+                ))
+            except Exception as e:
+                downloader.print_('MHTML media skipped: {} ({})'.format(url, e))
+
+        chunks.append('--{0}--\r\n'.format(boundary))
+        return {'url': BytesIO(''.join(chunks).encode('utf-8'))}
+
 
 class Downloader_kone(Downloader):
     type = 'kone'
-    URLS = ['kone.gg']
-    icon = 'https://kone.gg/images/sub_icon.png'
-    ACCEPT_COOKIES = [r'(.*\.)?kone\.gg']
+    URLS = URLS
+    single = False
+    strip_header = False
+    ACCEPT_COOKIES = ACCEPT_COOKIES
+    display_name = 'Kone.gg'
+    icon = 'https://kone.gg/favicon.ico'
 
     def init(self):
         self.session = Session()
-        self.session.headers['User-Agent'] = downloader.hdr['User-Agent']
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
-            'Referer': 'https://kone.gg/',
-            'Origin': 'https://kone.gg',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+            'Referer': KONE_ROOT + '/',
+            'User-Agent': downloader.hdr.get('User-Agent', 'Mozilla/5.0'),
         })
 
-    @property
-    def id(self):
-        pid = get_post_id(self.url)
-        return f'kone_{pid}' if pid else 'kone_unknown'
+    def _read_html(self):
+        try:
+            html = clf2.solve(self.url, session=self.session)
+            if isinstance(html, dict):
+                html = html.get('html') or html.get('data') or ''
+        except Exception:
+            res = self.session.get(self.url, timeout=60)
+            if hasattr(res, 'raise_for_status'):
+                res.raise_for_status()
+            html = getattr(res, 'text', None)
+            if html is None:
+                content = getattr(res, 'content', res)
+                html = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
+
+        return _fix_mojibake(html)
 
     def read(self):
-        token = None
-            
-        # Check data stability
-        js_check = """document.querySelector('#post_content').shadowRoot.querySelector('div[data-post-id]').getAttribute('data-post-id');"""
+        self.url = _abs_url(KONE_ROOT, self.url)
+        _split_post_url(self.url)
 
-        def f(html, browser=None):
-            browser.show()
-            def check_cb(r): nonlocal token; token = r
-            browser.runJavaScript(js_check, callback=check_cb)
-            
-            if token:
-                browser.hide()
-            return True
+        html = self._read_html()
+        parsed = _parse_article(html, self.url)
 
-        res = clf2.solve(self.url, f=f, session=self.session)
-        raw_html = res['html']
-
-        self.data_post_id = token
-
-        print_ = get_print(self.cw)
-        print_(f'token: {token}')
-
-
-        # 데이터 조립
-        full_stream_data = ""
-        scripts = re.findall(r'<script[^>]*>(.*?)</script>', raw_html, re.DOTALL)
-        for script_content in scripts:
-            if 'self.__next_f.push' in script_content:
-                try:
-                    start_idx = script_content.find('self.__next_f.push(') + len('self.__next_f.push(')
-                    end_idx = script_content.rfind(')')
-                    
-                    if start_idx > len('self.__next_f.push(') - 1 and end_idx > start_idx:
-                        json_str = script_content[start_idx:end_idx]
-                        chunk = json.loads(json_str)
-                        
-                        if isinstance(chunk, list) and len(chunk) >= 2 and isinstance(chunk[1], str):
-                            full_stream_data += chunk[1]
-                except: pass
-
-        # 데이터 추출
-        post_id = get_post_id(self.url)
-        if not post_id: raise Exception("게시글 ID를 찾을 수 없습니다.")
-
-        info = {'title': 'Untitled', 'content': '', 'writer': 'Unknown', 'date': datetime.datetime.now().strftime('%Y-%m-%d')}
-        found_data = False
-
-        # PackedArticle
-        if not found_data:
-            try:
-                key_idx = full_stream_data.find('"PackedArticle":')
-                if key_idx != -1:
-                    val_start = full_stream_data.find('"', key_idx + len('"PackedArticle":'))
-                    if val_start != -1:
-                        decoder = json.JSONDecoder()
-                        packed_str, _ = decoder.raw_decode(full_stream_data, val_start)
-
-                        article_data = json.loads(packed_str)
-                        
-                        art_id = article_data.get('id', {})
-                        art_id_val = art_id.get('v') if isinstance(art_id, dict) else art_id
-                        
-                        if art_id_val == post_id:
-                            info['title'] = article_data.get('title', 'Untitled')
-                            info['content'] = article_data.get('content', '')
-                            w_obj = article_data.get('writer', {})
-                            info['writer'] = w_obj.get('display_name', 'Unknown')
-                            created = article_data.get('created_at', {})
-                            c_val = created.get('v') if isinstance(created, dict) else created
-                            if c_val: info['date'] = c_val[:10]
-                            found_data = True
-            except: pass
-
-        # 스트림 스캔
-        if not found_data:
-            t_match = re.search(r'"v":"' + re.escape(post_id) + r'".*?"title":"(.*?)"', full_stream_data)
-            if t_match:
-                try: info['title'] = json.loads(f'"{t_match.group(1)}"')
-                except: info['title'] = t_match.group(1)
-            
-            c_match = re.search(r'"v":"' + re.escape(post_id) + r'".*?"content":"(.*?)(?<!\\)"', full_stream_data)
-            if c_match:
-                try: info['content'] = json.loads(f'"{c_match.group(1)}"')
-                except: pass
-            
-            w_match = re.search(r'"v":"' + re.escape(post_id) + r'".*?"display_name":"(.*?)"', full_stream_data)
-            if w_match:
-                try: info['writer'] = json.loads(f'"{w_match.group(1)}"')
-                except: pass
-            
-            d_match = re.search(r'"created_at":"(.*?)"', full_stream_data)
-            if d_match: info['date'] = d_match.group(1)[:10]
-
-        # 제목
-        if info['title'] == 'Untitled':
-            soup = Soup(raw_html)
-            if soup.title: info['title'] = soup.title.string.split('|')[0].strip()
-        self.title = clean_title(info['title'])
-
-        # 카테고리 + 제목
-        try:
-            soup = Soup(raw_html)
-            h1 = soup.find('h1', class_='flex')
-            if h1:
-                title_text = h1.get_text(strip=True)
-                badge = h1.find_previous_sibling('span', attrs={'data-slot': 'badge'})
-                
-                if badge:
-                    cat_name = badge.get_text(strip=True)
-                    self.title = clean_title(f'[{cat_name}] {title_text}')
-        except: pass
-
-        # 댓글 추출
-        comments = []
-        try:
-            comments_match = re.search(r'"Comments":(\[.*?\])', full_stream_data)
-            if comments_match:
-                json_comments = json.loads(comments_match.group(1))
-                for c in json_comments:
-                    w = c.get('writer', {}).get('display_name', 'Unknown')
-                    t = c.get('content', '')
-                    d = c.get('created_at', '')[:10]
-                    pid = c.get('parent_id')
-                    comments.append({'writer': w, 'content': t, 'date': d, 'parent_id': pid})
-        except: pass
-
-        if not comments:
-            soup = Soup(raw_html)
-            for item in soup.find_all('div', class_='group/comment'):
-                try:
-                    w_tag = item.find('a', href=re.compile(r'^/u/'))
-                    w = w_tag.get_text(strip=True) if w_tag else "Unknown"
-                    if w_tag and w_tag.find('img') and w_tag.find('img').get('alt'):
-                        w = w_tag.find('img').get('alt')
-                    c_tag = item.find('div', class_='whitespace-pre-wrap')
-                    c = c_tag.get_text('\n', strip=True) if c_tag else ""
-                    d_tag = item.find('div', class_='text-zinc-500')
-                    d = d_tag.get_text(strip=True) if d_tag else ""
-                    parent = item.find_parent('div', class_='relative')
-                    is_reply = parent and ('ml-' in str(parent.get('class', [])))
-                    comments.append({'writer': w, 'content': c, 'date': d, 'parent_id': is_reply})
-                except: pass
-
-        # HTML에서 이미지(열화판) 추출
-        image_list = []
-        seen = set()
-        
-        content_soup = Soup(info['content'])
-        for img in content_soup.find_all('img'):
-            src = img.get('src') or img.get('data-originalurl')
-            if not src:
-                continue
-        
-            full_url = urljoin(self.url, src).replace(r'\/', '/')
-        
-            if full_url in seen:
-                continue
-
-            seen.add(full_url)
-            image_list.append(full_url)
-
-        # 원본 이미지 URL 가져오기 시도
-        original_url_imgs = []
-        data_post_id = self.data_post_id
-        print_ = get_print(self.cw)
-        api_url = ""
-
-        if data_post_id and image_list:
-            try:
-                api_url = f"https://api.kone.gg/v0/article/{data_post_id}/media/original"
-                api_data = {'media_url': image_list}
-                api_headers = self.session.headers.copy()
-                api_headers['Content-Type'] = 'application/json'
-
-                response = self.session.post(api_url, json=api_data, headers=api_headers, timeout=10)
-                response.raise_for_status()
-                media_data = response.json()
-                
-                original_url_imgs = [media.get('url') for media in media_data.get('media', []) if media.get('url')]
-                print_(f'[Kone] 원본 이미지 추출 성공: {len(original_url_imgs)}개')
-            except Exception as e:
-                print_(f'[Kone] 원본 API 호출 실패: {e}')
-                original_url_imgs = []
+        title = parsed['title'] or parsed['post_id']
+        category = parsed.get('category') or ''
+        if category and category not in title:
+            archive_name = '[{0}] {1}_{2}'.format(category, title, parsed['post_id'])
         else:
-            if not data_post_id:
-                print_('[Kone] data_post_id가 없으므로 열화판으로 진행합니다.')
+            archive_name = '{0}_{1}'.format(title, parsed['post_id'])
+        parsed['archive_name'] = clean_title(archive_name)
+        parsed = _apply_local_media_paths(parsed)
 
-        # URL 리스트 확정 및 파일 객체 생성
+        self.title = parsed['archive_name']
         self.urls = []
-        url_to_filename = {}
 
-        # ID가 있고, 개수가 일치할 때만 원본 모드 활성화
-        use_original = data_post_id and (len(image_list) == len(original_url_imgs))
+        for item in parsed.get('media') or []:
+            self.urls.append(KoneMedia({
+                'url': item['url'],
+                'name': item['name'],
+            }, self.url))
 
-        for i, raw_url in enumerate(image_list):
-            target_url = original_url_imgs[i] if use_original else raw_url
-            
-            clean_url = target_url
-            ext = get_ext(clean_url) or '.webp'
-            filename = f'{i+1:04}{ext}'
-            
-            file_obj = File_kone({
-                'url': clean_url, 
-                'name': filename, 
-                'referer': api_url if use_original else self.url
-            }, fallback_url=raw_url if use_original else None)
+        self.urls.append(KoneMHTML(parsed, self.session))
 
-            self.urls.append(file_obj)
-            
-            url_to_filename[raw_url] = filename
-            url_to_filename[clean_url] = filename
-            url_to_filename[raw_url.replace('&', '&amp;')] = filename
-
-            if 'mittere.io' in clean_url:
-                try:
-                    file_hash = clean_url.split('/')[-1]
-                    url_to_filename[file_hash] = filename
-                except: pass
-
-        # HTML 생성
-        html_data = {
-            'title': info['title'],
-            'content': info['content'],
-            'writer': info['writer'],
-            'date': info['date'],
-            'url': self.url,
-            'comments': comments,
-            'url_map': url_to_filename
-        }
-        self.urls.append(HTML(html_data))
+        downloader.print_('Kone media: {}'.format(len(parsed.get('media') or [])))
+        downloader.print_('Kone comments: {}'.format(len(parsed.get('comments') or [])))
 
 
-class File_kone(File):
-    def __init__(self, info, fallback_url=None):
-        super().__init__(info)
-        self.fallback_url = fallback_url
-        self.referer_url = info.get('referer')
-
-    def alter(self):
-        if self.fallback_url: return self.fallback_url
-        return self.referer_url
-
-class HTML(File):
-    type = 'kone'
-    format = 'title'
-
-    def __init__(self, info):
-        title = clean_title(info.get('title', 'No Title'))
-        super().__init__({'name': f"{title}.html"})
-        self.info_data = info 
-
-    def get(self):
-        return self.make_html()
-
-    def make_html(self):
-        data = self.info_data
-        url_map = data.get('url_map', {})
-        content = data['content']
-
-        # 문자열 치환
-        for original, filename in url_map.items():
-            if len(original) > 10:
-                content = content.replace(original, filename)
-            
-            # 해시값 치환
-            if len(original) > 20 and '/' not in original:
-                pattern = re.compile(r'src="[^"]*?' + re.escape(original) + r'[^"]*"')
-                content = pattern.sub(f'src="{filename}"', content)
-
-        # DOM 정리
-        try:
-            soup = Soup(content)
-            for img in soup.find_all('img'):
-                src = img.get('src', '')
-                if not src.startswith('http'):
-                    for attr in ['srcset', 'loading', 'style', 'width', 'height', 'class', 'data-originalurl']:
-                        if img.has_attr(attr): del img[attr]
-                    img['style'] = "max-width: 100%; height: auto; display: block; margin: 20px auto; border-radius: 8px;"
-            
-            for tag in soup.find_all(['video', 'script', 'iframe', 'style']):
-                tag.decompose()
-            for a in soup.find_all('a'): a['target'] = '_blank'
-            
-            content = str(soup)
-        except: pass
-
-        # 댓글 HTML
-        comments_html = ""
-        if data['comments']:
-            for c in data['comments']:
-                initial = c['writer'][0] if c['writer'] else "?"
-                indent_style = "margin-left: 2rem; border-left: 2px solid #3f3f46; padding-left: 0.5rem;" if c.get('parent_id') else ""
-                
-                comments_html += f"""
-                <div class="comment-item" style="{indent_style}">
-                    <div class="comment-avatar">{initial}</div>
-                    <div class="comment-body">
-                        <div class="comment-meta">
-                            <span class="comment-author">{c['writer']}</span>
-                            <span class="comment-date">{c['date']}</span>
-                        </div>
-                        <div class="comment-text">{c['content']}</div>
-                    </div>
-                </div>
-                """
-        else:
-            comments_html = "<div style='color:#777; text-align:center; padding:20px;'>댓글이 없습니다.</div>"
-
-        # HTML
-        html = f"""
-        <!DOCTYPE html>
-        <html lang="ko">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>{data['title']}</title>
-            <style>{KONE_CLEAN_CSS}</style>
-        </head>
-        <body>
-            <div class="layout">
-                <header>
-                    <span class="badge">Kone</span>
-                    <h1>{data['title']}</h1>
-                    <div class="meta">
-                        <div class="avatar">{data['writer'][0] if data['writer'] else '?'}</div>
-                        <span>{data['writer']}</span>
-                        <span>•</span>
-                        <span>{data['date']}</span>
-                        <span>•</span>
-                        <a href="{data['url']}" target="_blank">원본 링크</a>
-                    </div>
-                </header>
-                
-                <div class="prose">
-                    {content}
-                </div>
-
-                <div class="comments-section">
-                    <div class="comments-header">
-                        댓글 {len(data['comments'])}
-                    </div>
-                    {comments_html}
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-        
-        f = BytesIO()
-        f.write(html.encode('utf-8'))
-        f.seek(0)
-        return {'url': f}
-
-messageBox('{}: kone (Debug Ver)'.format(tr_('사이트를 추가했습니다')))
+try:
+    messageBox('{}: kone.gg'.format(tr_('Site added')))
+except Exception:
+    pass
