@@ -52,7 +52,8 @@ URLS = [
 ]
 
 MEDIA_TAGS = ('img', 'video', 'audio', 'source')
-DROP_TAGS = ('script', 'style', 'button', 'svg', 'input', 'textarea', 'select', 'form')
+DROP_TAGS = ('script', 'style', 'svg', 'input', 'textarea', 'select', 'form')
+ARCHIVE_AS_MHTML = False
 
 CONTENT_TYPE_EXTS = {
     'image/jpeg': '.jpg',
@@ -177,10 +178,14 @@ def _class_list(value):
 
 
 def _has_class(tag, class_name):
+    if not tag or getattr(tag, 'attrs', None) is None:
+        return False
     return class_name in _class_list(tag.get('class'))
 
 
 def _has_classes(tag, class_names):
+    if not tag or getattr(tag, 'attrs', None) is None:
+        return False
     classes = _class_list(tag.get('class'))
     return all(class_name in classes for class_name in class_names)
 
@@ -211,6 +216,12 @@ def _find_all_class(root, class_name, name=True):
 
 def _clean_dom(node, base_url):
     _remove_comments(node)
+
+    for button in list(node.find_all('button')):
+        if button.find(MEDIA_TAGS):
+            button.unwrap()
+        else:
+            button.decompose()
 
     for tag in list(node.find_all(DROP_TAGS)):
         tag.decompose()
@@ -245,6 +256,10 @@ def _clean_dom(node, base_url):
 
         if name == 'iframe' and tag.get('src'):
             tag['src'] = _abs_url(base_url, tag.get('src'))
+
+    for tag in list(node.find_all(True)):
+        if _has_class(tag, 'absolute') and not tag.find(MEDIA_TAGS):
+            tag.decompose()
 
     for tag in list(node.find_all(['div', 'span'])):
         if tag.name is None:
@@ -506,15 +521,17 @@ class KoneMHTML(File):
     def __init__(self, parsed, session):
         self.parsed = parsed
         self.session = session
+        ext = 'mhtml' if ARCHIVE_AS_MHTML else 'html'
         File.__init__(self, {
-            'name': '{}.mhtml'.format(clean_title(parsed['archive_name'])),
+            'name': '{}.{}'.format(clean_title(parsed['archive_name']), ext),
         })
 
-    def _html(self):
+    def _html(self, mhtml=False):
         p = self.parsed
         title = escape(p.get('title') or 'kone')
         url = escape(p.get('url') or '')
-        base_url = escape(p.get('mhtml_base') or '')
+        base_url = escape(p.get('mhtml_base') or '') if mhtml else ''
+        base_tag = '<base href="{}">\n'.format(base_url) if base_url else ''
         category = escape(p.get('category') or '')
         writer = escape(p.get('writer') or '')
         visible_time = escape(p.get('visible_time') or p.get('published') or '')
@@ -553,8 +570,7 @@ class KoneMHTML(File):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<base href="{base_url}">
-<title>{title}</title>
+{base_tag}<title>{title}</title>
 <style>
 :root {{
   color-scheme: dark;
@@ -656,7 +672,7 @@ td, th {{ border: 1px solid var(--line); padding: 6px 8px; }}
 </html>'''.format(
             title=title,
             url=url,
-            base_url=base_url,
+            base_tag=base_tag,
             meta=''.join('<span>{}</span>'.format(x) for x in meta_bits),
             content=p.get('content_html') or '',
             comment_count=len(p.get('comments') or []),
@@ -704,8 +720,11 @@ td, th {{ border: 1px solid var(--line); padding: 6px 8px; }}
         ).format(content_type, location, self._b64(data))
 
     def get(self):
+        if not ARCHIVE_AS_MHTML:
+            return {'url': BytesIO(self._html(False).encode('utf-8'))}
+
         boundary = '----=_Kone_{0}'.format(uuid.uuid4().hex)
-        html_data = self._html().encode('utf-8')
+        html_data = self._html(True).encode('utf-8')
         base_url = self.parsed.get('mhtml_base') or (KONE_ROOT + '/')
 
         chunks = [
