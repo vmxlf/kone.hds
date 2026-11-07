@@ -1,20 +1,25 @@
 #coding: utf8
 #title: Kone.gg
-#comment: Kone.gg article downloader
+#comment: Kone.gg article downloader (2026-11-07 Hitomi runtime fix)
 
 from __future__ import print_function
 
 import base64
 import mimetypes
+import os
 import re
+import ssl
+import time
 import uuid
 from io import BytesIO
+from urllib.error import HTTPError
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 import clf2
 import downloader
 import errors
 from translator import tr_
-from utils import Downloader, File, Session, Soup, clean_title, get_ext, urljoin
+from utils import Downloader, LazyUrl, Session, Soup, clean_title, get_ext, urljoin
 
 try:
     from bs4 import Comment
@@ -52,8 +57,15 @@ URLS = [
 ]
 
 MEDIA_TAGS = ('img', 'video', 'audio', 'source')
+COMMENT_ID = re.compile(r'^comment-[A-Za-z0-9_-]{22}$')
 DROP_TAGS = ('script', 'style', 'svg', 'input', 'textarea', 'select', 'form')
 ARCHIVE_AS_MHTML = False
+INCLUDE_CATEGORY_IN_TITLE = True
+DOWNLOAD_STICKERS = True
+STICKER_TIMEOUT = 3.0
+STICKER_BUDGET = 8.0
+STICKER_MAX_BYTES = 4 * 1024 * 1024
+STICKER_TOTAL_BYTES = 16 * 1024 * 1024
 
 CONTENT_TYPE_EXTS = {
     'image/jpeg': '.jpg',
@@ -98,6 +110,170 @@ def _abs_url(base, value):
 
 def _is_downloadable(url):
     return bool(url) and not url.startswith('data:') and not url.startswith('blob:')
+
+
+def _is_kone_sticker(url):
+    try:
+        parsed = urlparse(url)
+        return (parsed.scheme == 'https' and parsed.hostname == 'api.kone.gg'
+                and not parsed.username and not parsed.password
+                and parsed.port in (None, 443)
+                and re.fullmatch(r'/v1/sticker/image/[A-Za-z0-9_-]+/?', parsed.path) is not None)
+    except (ValueError, TypeError):
+        return False
+
+
+def _is_sticker_redirect(url):
+    if _is_kone_sticker(url):
+        return True
+    try:
+        parsed = urlparse(url)
+        return (parsed.scheme == 'https' and (parsed.hostname or '').endswith('.mittere.io')
+                and not parsed.username and not parsed.password
+                and parsed.port in (None, 443))
+    except (ValueError, TypeError):
+        return False
+
+
+class _StickerSkipped(Exception):
+    pass
+
+
+class _StickerNoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _sticker_opener():
+    # Hitomi changes urllib's default TLS context; keep this client verified.
+    context = ssl.create_default_context()
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = True
+    return build_opener(HTTPSHandler(context=context), _StickerNoRedirect())
+
+
+def _sticker_type(data):
+    if data.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'image/png'
+    if data.startswith((b'GIF87a', b'GIF89a')):
+        return 'image/gif'
+    if data.startswith(b'\xff\xd8\xff'):
+        return 'image/jpeg'
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'image/webp'
+    if data[:2] == b'BM':
+        return 'image/bmp'
+    if data[4:8] == b'ftyp' and data[8:12] in (b'avif', b'avis'):
+        return 'image/avif'
+    raise _StickerSkipped('not an image')
+
+
+def _fetch_sticker(opener, url, deadline, limit):
+    if limit <= 0:
+        raise _StickerSkipped('article sticker budget reached')
+    # Follow at most two API/CDN redirects, with no cookies or retry loop.
+    for redirects in range(3):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _StickerSkipped('article sticker budget reached')
+        request = Request(url, headers={
+            'User-Agent': 'Mozilla/5.0',
+            'Referer': KONE_ROOT + '/',
+            'Origin': KONE_ROOT,
+            'Accept': 'image/*',
+        })
+        try:
+            response = opener.open(request, timeout=min(STICKER_TIMEOUT, remaining))
+            break
+        except HTTPError as exc:
+            status = exc.code
+            location = exc.headers.get('Location', '')
+            exc.close()
+            target = _abs_url(url, location)
+            if status in (301, 302, 303, 307, 308) and redirects < 2 and _is_sticker_redirect(target):
+                url = target
+                continue
+            raise _StickerSkipped('HTTP {}'.format(status))
+    try:
+        if response.status != 200:
+            raise _StickerSkipped('HTTP {}'.format(response.status))
+        ctype = response.headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
+        if ctype and not (ctype.startswith('image/') or ctype == 'application/octet-stream'):
+            raise _StickerSkipped('non-image response')
+        if response.headers.get('Content-Encoding', 'identity').lower() != 'identity':
+            raise _StickerSkipped('unexpected content encoding')
+        length = response.headers.get('Content-Length')
+        expected = int(length) if length is not None else None
+        if expected is not None and (expected <= 0 or expected > limit):
+            raise _StickerSkipped('invalid image size')
+        data = bytearray()
+        while True:
+            if time.monotonic() >= deadline:
+                raise _StickerSkipped('article sticker budget reached')
+            # read1 returns available bytes; a slow trickle cannot fill a large read forever.
+            chunk = response.read1(min(64 * 1024, limit + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > limit:
+                raise _StickerSkipped('image too large')
+        if not data or (expected is not None and len(data) != expected):
+            raise _StickerSkipped('incomplete image')
+        return _sticker_type(data), bytes(data)
+    finally:
+        response.close()
+
+
+def _mark_skipped_stickers(html, skipped):
+    soup = Soup(html)
+    for tag in list(soup.find_all(MEDIA_TAGS)):
+        if tag.get('src') in skipped:
+            label = soup.new_tag('span', attrs={'class': 'kone-sticker-skipped'})
+            label.string = '[코네콘 저장 생략]'
+            tag.replace_with(label)
+        elif tag.get('poster') in skipped:
+            del tag.attrs['poster']
+    # Hitomi's Soup.__str__ returns the original input, not the edited DOM.
+    return soup.decode_contents()
+
+
+def _prepare_stickers(parsed):
+    media = parsed.get('media') or []
+    if not any(_is_kone_sticker(item['url']) for item in media):
+        return parsed
+    deadline = time.monotonic() + STICKER_BUDGET
+    # A private opener has no shared cookie jar or automatic retry loop.
+    opener, skip_reason = None, 'disabled'
+    if DOWNLOAD_STICKERS:
+        try:
+            opener = _sticker_opener()
+        except Exception as exc:
+            skip_reason = 'client setup failed: ' + type(exc).__name__
+    remaining_bytes = STICKER_TOTAL_BYTES
+    kept, skipped = [], set()
+    for item in media:
+        if _is_kone_sticker(item['url']):
+            try:
+                if opener is None:
+                    raise _StickerSkipped(skip_reason)
+                ctype, data = _fetch_sticker(
+                    opener, item['url'], deadline, min(STICKER_MAX_BYTES, remaining_bytes))
+                item['data'] = data
+                item['content_type'] = ctype
+                item['name'] = os.path.splitext(item['name'])[0] + CONTENT_TYPE_EXTS[ctype]
+                remaining_bytes -= len(data)
+            except Exception as exc:
+                skipped.add(item['url'])
+                reason = str(exc) if isinstance(exc, _StickerSkipped) else type(exc).__name__
+                downloader.print_('Kone sticker skipped: {} ({})'.format(item['name'], reason))
+                continue
+        kept.append(item)
+    parsed['media'] = kept
+    if skipped:
+        parsed['content_html'] = _mark_skipped_stickers(parsed.get('content_html') or '', skipped)
+        for comment in parsed.get('comments') or []:
+            comment['html'] = _mark_skipped_stickers(comment.get('html') or '', skipped)
+    return parsed
 
 
 def _path_ext(url):
@@ -247,6 +423,8 @@ def _clean_dom(node, base_url):
                 tag['rel'] = 'noopener noreferrer'
 
         if name in ('img', 'video', 'audio', 'source'):
+            # Local file images must not retain the API's CORS fetch requirement.
+            tag.attrs.pop('crossorigin', None)
             if tag.get('src'):
                 tag['src'] = _abs_url(base_url, tag.get('src'))
             if tag.get('poster'):
@@ -381,9 +559,27 @@ def _parse_comments(soup, base_url, media, seen):
     if not root:
         return []
 
+    items = _find_all_class(root, 'comment-item')
+    current_layout = not items
+    if current_layout:
+        items = root.find_all('div', id=COMMENT_ID)
+
     comments = []
-    for item in _find_all_class(root, 'comment-item'):
-        content = _find_class(item, 'whitespace-pre-wrap')
+    for item in items:
+        if current_layout:
+            # The body also holds sticker-only comments and moderation notices.
+            # Hitomi's plugin globals shadow the builtin next().
+            for content in item.find_all('div', class_='max-w-full'):
+                if content.find_parent(id=COMMENT_ID) is item:
+                    break
+            else:
+                continue
+            header = content.find_previous_sibling('div')
+            depth = len(item.find_parents(id=COMMENT_ID))
+        else:
+            content = _find_class(item, 'whitespace-pre-wrap')
+            header = item
+            depth = max(0, len(item.find_parents(class_='comment-list')) - 1)
         if not content:
             continue
 
@@ -391,22 +587,16 @@ def _parse_comments(soup, base_url, media, seen):
 
         user = ''
         user_url = ''
-        user_link = _find_user_link(item)
+        user_link = _find_user_link(header)
         if user_link:
             user_url = _abs_url(base_url, user_link.get('href'))
             user_span = user_link.find('span')
             user = _text(user_span) or _text(user_link)
 
         time_text = ''
-        meta = _find_classes(item, ('text-xs', 'text-muted-foreground'))
+        meta = _find_classes(header, ('text-xs', 'text-muted-foreground'))
         if meta:
             time_text = _text(meta)
-
-        depth = 0
-        try:
-            depth = max(0, len(item.find_parents(class_='comment-list')) - 1)
-        except Exception:
-            depth = 0
 
         comments.append({
             'user': user,
@@ -458,7 +648,9 @@ def _find_writer(article):
 def _find_stats(article):
     text = _text(article)
     stats = []
-    for pattern in (r'조회\s*[0-9,]+', r'좋아요\s*-?[0-9,]+', r'댓글\s*[0-9,]+\s*개'):
+    for pattern in (r'조회\s*[0-9,]+|\b[0-9,]+\s+views?\b',
+                    r'좋아요\s*-?[0-9,]+|(?<!\w)-?[0-9,]+\s+points?\b',
+                    r'댓글\s*[0-9,]+\s*개|\b[0-9,]+\s+comments?\b'):
         m = re.search(pattern, text)
         if m:
             stats.append(m.group(0))
@@ -471,10 +663,14 @@ def _parse_article(html, url):
     if not article:
         raise LoginRequired()
 
-    content = _find_class(article, 'ProseMirror')
+    prose = _find_class(article, 'article-prose')
+    content = _find_class(prose, 'tiptap')
+    selector = '.tiptap' if content else '.ProseMirror'
+    content = content or _find_class(article, 'ProseMirror')
     if not content:
         raise Exception('Kone article body was not found')
 
+    header = article.find('header', recursive=False) or article
     media = []
     seen = set()
     _extract_media(content, url, media, seen)
@@ -483,7 +679,7 @@ def _parse_article(html, url):
 
     meta_time = soup.find('meta', {'property': 'article:published_time'})
     published = meta_time.get('content') if meta_time and meta_time.get('content') else ''
-    visible_time = _first_text_matching(article, r'\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}')
+    visible_time = _first_text_matching(header, r'\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}')
 
     sub_handle, post_id = _split_post_url(url)
 
@@ -491,40 +687,52 @@ def _parse_article(html, url):
         'url': url,
         'sub_handle': sub_handle,
         'post_id': post_id,
-        'title': _find_title(article, soup),
-        'category': _find_category(article, url),
-        'writer': _find_writer(article),
+        'title': _find_title(header, soup),
+        'category': _find_category(header, url),
+        'writer': _find_writer(header),
         'published': published,
         'visible_time': visible_time,
-        'stats': _find_stats(article),
-        'content_html': _fragment_html(content, url, '.ProseMirror', inner=True),
+        'stats': _find_stats(header),
+        'content_html': _fragment_html(content, url, selector, inner=True),
         'comments': comments,
         'media': media,
     }
     return parsed
 
 
-class KoneMedia(File):
-    type = 'kone'
-
+class KoneMedia:
     def __init__(self, info, referer):
+        self.name = info['name']
+        if not self.name or self.name in ('.', '..') or any(c in self.name for c in '/\\:'):
+            raise ValueError('Kone output name must be a filename')
         self.referer = referer
-        File.__init__(self, info)
+        self._url = info.get('url')
+        self._data = info.get('data')
+        # A fresh staging name avoids Hitomi's existing-file checks on each run.
+        self.filename = '__kone_{}{}'.format(uuid.uuid4().hex, os.path.splitext(self.name)[1])
+        self.url = LazyUrl(referer, self.get, self, pp=self.pp, detect_local=False)
 
-    def alter(self):
-        return self.referer
+    def get(self, _=None):
+        if self._data is not None:
+            return BytesIO(self._data)
+        return self._url
+
+    def pp(self, filename):
+        destination = os.path.join(os.path.dirname(filename), self.name)
+        # Keep the previous file until the replacement has finished downloading.
+        os.replace(filename, destination)
+        return destination
 
 
-class KoneMHTML(File):
-    type = 'kone'
+class KoneMHTML(KoneMedia):
 
     def __init__(self, parsed, session):
         self.parsed = parsed
         self.session = session
         ext = 'mhtml' if ARCHIVE_AS_MHTML else 'html'
-        File.__init__(self, {
+        KoneMedia.__init__(self, {
             'name': '{}.{}'.format(clean_title(parsed['archive_name']), ext),
-        })
+        }, parsed.get('url') or KONE_ROOT)
 
     def _html(self, mhtml=False):
         p = self.parsed
@@ -619,6 +827,7 @@ a:hover {{ text-decoration: underline; }}
   margin: 14px 0;
 }}
 .kone-article p {{ margin: 0.85em 0; }}
+.kone-sticker-skipped {{ color: var(--muted); font-size: 13px; }}
 .kone-comments {{ margin-top: 28px; }}
 .kone-comments h2 {{ font-size: 18px; margin: 0 0 12px; }}
 .kone-comment {{
@@ -719,9 +928,9 @@ td, th {{ border: 1px solid var(--line); padding: 6px 8px; }}
             '{2}\r\n'
         ).format(content_type, location, self._b64(data))
 
-    def get(self):
+    def get(self, _=None):
         if not ARCHIVE_AS_MHTML:
-            return {'url': BytesIO(self._html(False).encode('utf-8'))}
+            return BytesIO(self._html(False).encode('utf-8'))
 
         boundary = '----=_Kone_{0}'.format(uuid.uuid4().hex)
         html_data = self._html(True).encode('utf-8')
@@ -745,7 +954,10 @@ td, th {{ border: 1px solid var(--line); padding: 6px 8px; }}
             if not _is_downloadable(url):
                 continue
             try:
-                content_type, data = self._fetch_media(url)
+                if item.get('data') is not None:
+                    content_type, data = item['content_type'], item['data']
+                else:
+                    content_type, data = self._fetch_media(url)
                 chunks.append('--{0}\r\n'.format(boundary))
                 chunks.append(self._part(
                     content_type,
@@ -756,7 +968,7 @@ td, th {{ border: 1px solid var(--line); padding: 6px 8px; }}
                 downloader.print_('MHTML media skipped: {} ({})'.format(url, e))
 
         chunks.append('--{0}--\r\n'.format(boundary))
-        return {'url': BytesIO(''.join(chunks).encode('utf-8'))}
+        return BytesIO(''.join(chunks).encode('utf-8'))
 
 
 class Downloader_kone(Downloader):
@@ -764,6 +976,9 @@ class Downloader_kone(Downloader):
     URLS = URLS
     single = False
     strip_header = False
+    # Do not reuse the previous run's resolved paths for unchanged media URLs.
+    detect_local_lazy = False
+    detect_removed = False
     ACCEPT_COOKIES = ACCEPT_COOKIES
     display_name = 'Kone.gg'
     icon = 'https://kone.gg/favicon.ico'
@@ -801,10 +1016,11 @@ class Downloader_kone(Downloader):
 
         html = self._read_html()
         parsed = _parse_article(html, self.url)
+        parsed = _prepare_stickers(parsed)
 
         title = parsed['title'] or parsed['post_id']
         category = parsed.get('category') or ''
-        if category and category not in title:
+        if INCLUDE_CATEGORY_IN_TITLE and category and category not in title:
             archive_name = '[{0}] {1}_{2}'.format(category, title, parsed['post_id'])
         else:
             archive_name = '{0}_{1}'.format(title, parsed['post_id'])
@@ -815,13 +1031,11 @@ class Downloader_kone(Downloader):
         self.urls = []
 
         for item in parsed.get('media') or []:
-            self.urls.append(KoneMedia({
-                'url': item['url'],
-                'name': item['name'],
-            }, self.url))
+            self.urls.append(KoneMedia(item, self.url).url)
 
-        self.urls.append(KoneMHTML(parsed, self.session))
+        self.urls.append(KoneMHTML(parsed, self.session).url)
 
+        downloader.print_('Kone: downloading fresh copies; replacing files after successful downloads')
         downloader.print_('Kone media: {}'.format(len(parsed.get('media') or [])))
         downloader.print_('Kone comments: {}'.format(len(parsed.get('comments') or [])))
 
