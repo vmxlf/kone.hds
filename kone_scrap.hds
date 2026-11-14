@@ -1,6 +1,6 @@
 #coding: utf8
 #title: Kone.gg
-#comment: Kone.gg article downloader (2026-11-07 Hitomi runtime fix)
+#comment: Kone.gg article downloader (2026-11-14 comment cleanup fix)
 
 from __future__ import print_function
 
@@ -393,16 +393,17 @@ def _find_all_class(root, class_name, name=True):
 def _clean_dom(node, base_url):
     _remove_comments(node)
 
-    for button in list(node.find_all('button')):
+    # Remove descendants first so decompose() never invalidates a pending tag.
+    for button in reversed(node.find_all('button')):
         if button.find(MEDIA_TAGS):
             button.unwrap()
         else:
             button.decompose()
 
-    for tag in list(node.find_all(DROP_TAGS)):
+    for tag in reversed(node.find_all(DROP_TAGS)):
         tag.decompose()
 
-    for tag in list(node.find_all(True)):
+    for tag in node.find_all(True):
         name = tag.name.lower()
 
         for attr in list(tag.attrs):
@@ -435,12 +436,12 @@ def _clean_dom(node, base_url):
         if name == 'iframe' and tag.get('src'):
             tag['src'] = _abs_url(base_url, tag.get('src'))
 
-    for tag in list(node.find_all(True)):
+    for tag in reversed(node.find_all(True)):
         if _has_class(tag, 'absolute') and not tag.find(MEDIA_TAGS):
             tag.decompose()
 
-    for tag in list(node.find_all(['div', 'span'])):
-        if tag.name is None:
+    for tag in reversed(node.find_all(['div', 'span'])):
+        if getattr(tag, 'attrs', None) is None:
             continue
         has_media = tag.find(['img', 'video', 'audio', 'iframe', 'br'])
         if not has_media and not tag.get_text(strip=True) and not tag.get('id'):
